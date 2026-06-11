@@ -1,6 +1,12 @@
 # 采购单据与库存增减、费用入账协作链路分析
 
 > 本文档基于 Akaunting v3.x 源码，深入分析采购账单（Bill）从创建到支付的全链路中，**库存增减记录**与**费用记账（Transaction）**是如何协作触发的。
+>
+> **⚠️ 关键勘误（相比初版）：**
+> 1. `PaymentReceived` 事件**不在**采购付款路径上，它是销售发票在线支付专用
+> 2. 作废（Cancel）采购单**不影响**库存（document_items 保留），只有删除（Delete）才会清除库存记录
+> 3. 费用类型（expense/income）由 `config/type.php` 配置决定，通过付款模态框的隐藏字段传入
+> 4. `inventory_stock_action` 是配置预留项，核心代码未直接使用
 
 ---
 
@@ -87,7 +93,7 @@ event: DocumentCreated  →  触发监听器链
 
 ---
 
-## 三、库存增减机制：从 quantity 字段到动态化
+## 三、库存增减机制：动态计算而非字段保存
 
 ### ⚠️ 重要架构变更：v3.0 移除了库存字段
 
@@ -103,7 +109,18 @@ Schema::table('items', function(Blueprint $table) {
 - **v1/v2 设计**：`items.quantity` 保存实时库存，每次采购/销售需同步更新该字段
 - **v3+ 设计**：库存完全由 `document_items` 动态计算，消除冗余数据与并发更新问题
 
-### 3.1 当前库存跟踪机制
+### 3.1 inventory_stock_action 配置：预留扩展点
+
+在配置文件 [type.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/config/type.php) 中，每种单据类型定义了 `inventory_stock_action`：
+
+| 单据类型 | inventory_stock_action | 含义 |
+|----------|------------------------|------|
+| `Document::BILL_TYPE` | `'increase'` | 采购增加库存 |
+| `Document::INVOICE_TYPE` | `'decrease'` | 销售减少库存 |
+
+**⚠️ 重要说明**：该配置项在核心代码中**未被直接使用**（全代码库搜索无引用），它是为库存管理模块预留的扩展点。实际库存计算由 `document_items` 表的 `type` 字段（bill/invoice）隐式区分。
+
+### 3.2 当前库存跟踪机制
 
 在 [Item.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Models/Common/Item.php#L74-L87) 中，模型提供了两个关键关联：
 
@@ -128,7 +145,7 @@ public function invoice_items()
 - **采购入库**：创建 `type = 'bill'` 的 DocumentItem 时，`quantity` 字段记录了该商品的采购数量（正向增加）
 - **销售出库**：创建 `type = 'invoice'` 的 DocumentItem 时，`quantity` 为销售数量（负向减少）
 
-### 3.2 采购明细创建链路
+### 3.3 采购明细创建链路
 
 `CreateDocumentItemsAndTotals` → 逐行调用 `CreateDocumentItem`
 
@@ -163,7 +180,7 @@ public function invoice_items()
 6. 写入 document_item_taxes 表
 ```
 
-### 3.3 写入 DocumentTotals：账单汇总
+### 3.4 写入 DocumentTotals：账单汇总
 
 明细处理完毕后，`CreateDocumentItemsAndTotals` 按 `sort_order` 写入 `document_totals` 表：
 
@@ -180,9 +197,31 @@ public function invoice_items()
 
 ---
 
-## 四、费用入账（Transaction）：从「收到账单」到「实际付款」
+## 四、费用入账（Transaction）：付款模态框直接触发
 
-采购 Bill 与费用 Transaction 是**松耦合**的 —— 它们通过**事件驱动**在适当时机关联。
+### ⚠️ 关键勘误：PaymentReceived 事件不在采购付款路径上
+
+**重要澄清**：
+- `PaymentReceived` 事件**仅用于销售发票（Invoice）的在线支付场景**
+- 采购 Bill 的付款**不经过 PaymentReceived 事件**
+- 采购付款有自己独立的路径：`DocumentTransactions` 模态框控制器 → `CreateBankingDocumentTransaction` Job
+
+| 路径 | 适用场景 | 触发方式 | type |
+|------|----------|----------|------|
+| PaymentController → PaymentReceived 事件 | 销售发票在线支付（前端门户/支付网关回调） | 事件驱动 | `income` |
+| DocumentTransactions 模态框 → CreateBankingDocumentTransaction | 采购账单付款（后台手动添加） | 直接调用 Job | `expense` |
+
+`PaymentReceived` 事件的唯一定义触发点在 [PaymentController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Abstracts/Http/PaymentController.php#L170-L179)：
+
+```php
+public function dispatchPaidEvent($invoice, $request)
+{
+    $request['type'] = 'income';  // 明确是 income（收入）
+    event(new PaymentReceived($invoice, $request));
+}
+```
+
+参数名 `$invoice` 也明确表明这是给销售发票用的。
 
 ### 4.1 状态机：Bill 的生命周期
 
@@ -229,13 +268,13 @@ if (! in_array($event->document->status, ['partial', 'paid'])) {
 
 **关键点**：这一步只改 `status`，不写 `transactions` 表——它代表"货物/账单已到，应付账款确认"，而非"银行已付款"。
 
-### 4.3 实际付款：创建 Expense Transaction（费用入账核心）
+### 4.3 实际付款：费用入账的真实入口
 
-付款有两个入口，最终汇聚到同一个 Job：
+采购付款有两个入口，但最终都汇聚到 `CreateBankingDocumentTransaction` Job：
 
-#### 入口 A：模态框手动添加支付
+#### 入口 A：模态框手动添加支付（主要路径）
 
-控制器 [DocumentTransactions.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Http/Controllers/Modals/DocumentTransactions.php#L128-L143)：
+这是采购付款的**主要路径**。在 Bill 详情页点击"Add Payment"按钮，弹出模态框，提交后由 [DocumentTransactions.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Http/Controllers/Modals/DocumentTransactions.php#L128-L143) 处理：
 
 ```php
 public function store(Document $document, Request $request)
@@ -247,31 +286,83 @@ public function store(Document $document, Request $request)
 }
 ```
 
-#### 入口 B：PaymentReceived 事件驱动
+**⚠️ 没有事件派发，直接调用 Job。**
 
-在 [Event.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Providers/Event.php#L73-L76) 中绑定：
+#### 入口 B：从供应商页面跳转创建费用
+
+在 [Vendors.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Http/Controllers/Purchases/Vendors.php#L267) 中，有一个创建费用的快捷入口：
 
 ```php
-PaymentReceived::class => [
-    CreateDocumentTransaction::class,      // ← 创建 Transaction
-    SendDocumentPaymentNotification::class,
+return redirect()->route('transactions.create', ['type' => 'expense'])
+    ->withInput($data);
+```
+
+这会跳转到通用的费用创建页面，不关联具体 Bill。
+
+### 4.4 费用类型如何确定：来自配置 + 隐藏字段
+
+付款模态框的 type 不是在后端动态判断的，而是通过视图的**隐藏字段**直接提交的。
+
+视图 [payment.blade.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/resources/views/modals/documents/payment.blade.php#L138)：
+
+```html
+<x-form.input.hidden 
+    name="type" 
+    :value="config('type.document.' . $document->type . '.transaction_type')" 
+/>
+```
+
+配置 [type.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/config/type.php#L255-L258)：
+
+```php
+Document::BILL_TYPE => [
+    'category_type'             => Category::EXPENSE_TYPE,
+    'transaction_type'          => Transaction::EXPENSE_TYPE,  // 'expense'
+    // ...
+    'inventory_stock_action'    => 'increase',
 ],
 ```
 
-监听器 [CreateDocumentTransaction.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Listeners/Document/CreateDocumentTransaction.php#L20-L50)：
+**完整链路**：
+```
+Bill 详情页 → "Add Payment" 按钮
+    ↓
+DocumentTransactions::create() → 渲染模态框
+    ↓
+隐藏字段 type = config('type.document.bill.transaction_type') = 'expense'
+    ↓
+用户提交表单
+    ↓
+DocumentTransactions::store()
+    ↓
+CreateBankingDocumentTransaction Job
+    ↓
+CreateTransaction Job → 写入 transactions(type='expense')
+```
+
+### 4.5 CreateTransaction 中的类型兜底逻辑
+
+虽然采购付款的 type 在表单中就已经确定，但 [CreateTransaction.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Jobs/Banking/CreateTransaction.php#L20-L29) 中还有一层兜底判断：
 
 ```php
-public function handle(Event $event)
-{
-    $this->dispatch(new CreateBankingDocumentTransaction(
-        $event->document, $event->request
-    ));
+if (! array_key_exists($this->request->get('type'), config('type.transaction'))) {
+    $isExpense = str_contains((string) $this->request->get('type', ''), 'expense');
+    $isRecurring = ! empty($this->request->get('recurring_frequency')) 
+        && $this->request->get('recurring_frequency') !== 'no';
+
+    $type = $isExpense
+        ? ($isRecurring ? Transaction::EXPENSE_RECURRING_TYPE : Transaction::EXPENSE_TYPE)
+        : ($isRecurring ? Transaction::INCOME_RECURRING_TYPE : Transaction::INCOME_TYPE);
+
+    $this->request->merge(['type' => $type]);
 }
 ```
 
-#### 核心 Job：CreateBankingDocumentTransaction
+这段逻辑的作用：如果传入的 type 不在 `config('type.transaction')` 的键中（即不是已注册的事务类型），则通过字符串包含 `'expense'` 来判断是收入还是支出。对于正常的采购付款路径，type 已经是 `'expense'`，会直接通过第一层检查，不会走到兜底逻辑。
 
-费用入账的真正逻辑在 [CreateBankingDocumentTransaction.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Jobs/Banking/CreateBankingDocumentTransaction.php#L30-L131)：
+### 4.6 核心 Job：CreateBankingDocumentTransaction
+
+费用入账的真正业务逻辑在 [CreateBankingDocumentTransaction.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Jobs/Banking/CreateBankingDocumentTransaction.php#L30-L131)：
 
 ```
 handle() 流程:
@@ -305,8 +396,7 @@ handle() 流程:
 ```
 handle():
 ┌─ event: TransactionCreating
-├─ 判断 transaction type（核心！）
-│   └─ bill 类型 → type = 'expense'
+├─ 类型校验（config type 存在则直接用，否则 str_contains 兜底）
 ├─ DB::transaction
 │   ├─ Transaction::create()
 │   │   ├─ type = 'expense'       ← 费用入账关键标识
@@ -324,7 +414,7 @@ handle():
 
 **费用入账标志**：`transactions.type = 'expense'` + `document_id = bill.id`
 
-### 4.4 事务联动：Transaction Observer
+### 4.7 事务联动：Transaction Observer
 
 [Transaction.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Observers/Transaction.php#L23-L59) 观察 Transaction 的删除事件，自动回滚 Bill 状态：
 
@@ -351,33 +441,97 @@ protected function updateDocument($transaction, $type)
 }
 ```
 
-### 4.5 取消/作废：删除关联的费用 Transaction
+### 4.8 取消/作废：删除关联的费用 Transaction
 
 监听器 [MarkDocumentCancelled.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Listeners/Document/MarkDocumentCancelled.php#L20-L41) 触发 Job [CancelDocument.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Jobs/Document/CancelDocument.php#L20-L34)：
 
 ```php
 \DB::transaction(function () {
     $this->deleteRelationships($this->model, [
-        'transactions',   // ← 级联删除所有费用 Transaction
-        'recurring'
+        'transactions', 'recurring'  // 只删 transactions 和 recurring
     ]);
     $this->model->status = 'cancelled';
     $this->model->save();
 });
 ```
 
-**注意**：删除 transactions 时，`Transaction::mute()`（在 DeleteDocument 中）会临时禁用 Observer，以避免重复的状态回写。
+**⚠️ 注意**：
+- 作废（Cancel）只删除 `transactions` 和 `recurring`，**不删除 `items`（document_items）**
+- 即：作废采购单会清除费用入账记录，但**不会减少库存记录**
+- `Transaction::mute()`（在 DeleteDocument 中使用）会临时禁用 Observer，以避免重复的状态回写
 
-反过来，[RestoreDocument.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Listeners/Document/RestoreDocument.php) 仅将状态改回 `draft`（**不会恢复 transactions**，需要重新付款）。
+反过来，监听器 [RestoreDocument.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Listeners/Document/RestoreDocument.php) 仅将状态改回 `draft`（**不会恢复 transactions**，需要重新付款）。
 
 ---
 
-## 五、三者完整协作链路图
+## 五、作废 vs 删除：对库存和费用的不同影响
 
-### 5.1 场景一：创建采购账单 → 确认收到 → 全额支付
+这是最容易混淆的点，专门用一节说明：
+
+### 5.1 CancelDocument（作废）
+
+代码位置：[CancelDocument.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Jobs/Document/CancelDocument.php#L24-L31)
+
+```php
+$this->deleteRelationships($this->model, [
+    'transactions', 'recurring'
+]);
+```
+
+| 影响对象 | 是否删除 | 说明 |
+|----------|----------|------|
+| `documents` | 否（改状态） | status = 'cancelled' |
+| `document_items` | 否 | 库存记录保留 |
+| `document_totals` | 否 | 汇总记录保留 |
+| `transactions` | ✅ 是 | 费用记账被清除 |
+| `recurring` | ✅ 是 | 定期账单配置删除 |
+| `histories` | 否 | 历史记录保留 |
+
+**对库存的影响**：❌ 无影响（document_items 保留，库存不变）
+**对费用的影响**：✅ 清除（transactions 删除，费用回退）
+
+### 5.2 DeleteDocument（删除）
+
+代码位置：[DeleteDocument.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Jobs/Document/DeleteDocument.php#L20-L32)
+
+```php
+$this->deleteRelationships($this->model, [
+    'items', 'item_taxes', 'histories', 'transactions', 'recurring', 'totals'
+]);
+$this->model->delete();  // 软删除
+```
+
+| 影响对象 | 是否删除 | 说明 |
+|----------|----------|------|
+| `documents` | ✅ 是（软删） | deleted_at 标记 |
+| `document_items` | ✅ 是 | 库存记录删除 |
+| `document_totals` | ✅ 是 | 汇总记录删除 |
+| `document_item_taxes` | ✅ 是 | 行税记录删除 |
+| `transactions` | ✅ 是 | 费用记账被清除 |
+| `recurring` | ✅ 是 | 定期账单配置删除 |
+| `histories` | ✅ 是 | 历史记录删除 |
+
+**对库存的影响**：✅ 库存回退（document_items 删除）
+**对费用的影响**：✅ 清除（transactions 删除，费用回退）
+
+### 5.3 对比总结
+
+| 操作 | 库存变化 | 费用变化 | Bill 状态 | 数据可恢复 |
+|------|----------|----------|-----------|-----------|
+| 创建 Bill | ➕ 增加 | 不变 | draft | - |
+| 标记已收到 | 不变 | 不变 | received | 可回退到 draft |
+| 添加支付 | 不变 | ➕ 增加费用 | partial/paid | 可删除支付回退 |
+| 作废 (Cancel) | 不变 | ➖ 清除费用 | cancelled | 可恢复到 draft |
+| 删除 (Delete) | ➖ 减少 | ➖ 清除费用 | 软删除 | 可恢复（软删除） |
+
+---
+
+## 六、三者完整协作链路图
+
+### 6.1 场景一：创建采购账单 → 确认收到 → 全额支付
 
 ```
-用户操作: POST /bills
+用户操作: POST /purchases/bills
   │
   ▼
 [Bills::store]
@@ -411,10 +565,10 @@ protected function updateDocument($transaction, $type)
      └─ (若 amount=0 → 'paid')
 
 
-用户操作: 模态框添加支付（点击"Add Payment"）
+用户操作: 点击「Add Payment」→ 模态框提交
   │
   ▼
-[DocumentTransactions::store]
+[DocumentTransactions::store]  ← 采购付款主入口
   │
   ▼
 [CreateBankingDocumentTransaction Job]
@@ -434,7 +588,7 @@ protected function updateDocument($transaction, $type)
   └─ (event) DocumentTransactionCreated
 ```
 
-### 5.2 场景二：取消采购账单 → 回滚
+### 6.2 场景二：作废采购账单 → 回滚费用（保留库存）
 
 ```
 用户操作: 点击「Cancel」
@@ -449,31 +603,55 @@ protected function updateDocument($transaction, $type)
   │
   ▼
 [CancelDocument Job] ─── DB Transaction ──────┐
-  ├─ deleteRelationships(['transactions'])
+  ├─ deleteRelationships(['transactions', 'recurring'])
   │   └─ DELETE FROM transactions WHERE document_id = ?
   │      → 费用记录被撤销 ❌
+  │   (⚠️ 不删除 document_items，库存保留)
   └─ bill.status = 'cancelled'
 ```
 
-### 5.3 数据联动汇总表
+### 6.3 场景三：删除采购账单 → 库存和费用全部清除
+
+```
+用户操作: 点击「Delete」
+  │
+  ▼
+[Bills::destroy]
+  │
+  ▼
+[DeleteDocument Job] ─── DB Transaction ──────┐
+  ├─ Transaction::mute()  // 禁用 Observer，避免重复回写
+  ├─ deleteRelationships([
+  │     'items',         ← document_items 删除 → 库存回退 ❌
+  │     'item_taxes',
+  │     'histories',
+  │     'transactions',  ← 费用删除 ❌
+  │     'recurring',
+  │     'totals'
+  │ ])
+  ├─ $this->model->delete()  // 软删除
+  └─ Transaction::unmute()
+```
+
+### 6.4 数据联动汇总表（修正版）
 
 | 操作 | documents (status) | document_items (库存) | transactions (费用) | 触发事件 |
 |------|--------------------|----------------------|---------------------|----------|
 | 创建 Bill | `draft` | ✅ **INSERT** (入库) | - | DocumentCreated |
 | 标记已收到 | `received` | - | - | DocumentReceived |
-| 部分付款 | `partial` | - | ✅ **INSERT** (expense) | PaymentReceived → TransactionCreated |
+| 部分付款 | `partial` | - | ✅ **INSERT** (expense) | DocumentTransactionCreating / Created |
 | 再次付款（结清） | `paid` | - | ✅ **INSERT** | 同上 |
 | 修改 Bill | 不变 | ❌ **DELETE + REINSERT**（先删后重建） | -（若未对账） | DocumentUpdated |
-| 删除 Transaction (Observer) | `received`/`partial` | - | ❌ **DELETE** | (Observer deleted) |
-| 取消 Bill | `cancelled` | -（保留，但不再参与库存计算）| ❌ **全 DELETE** | DocumentCancelled |
-| 恢复 Bill | `draft` | - | -（不恢复支付） | DocumentRestored |
-| 删除 Bill | softDelete | softDelete | softDelete | DocumentDeleted |
+| 删除单条支付 (Observer) | `received`/`partial` | - | ❌ **DELETE** | (Observer deleted) |
+| 取消 Bill (Cancel) | `cancelled` | -（保留） | ❌ **全 DELETE** | DocumentCancelled |
+| 恢复 Bill | `draft` | -（保留） | -（不恢复支付） | DocumentRestored |
+| 删除 Bill (Delete) | softDelete | ❌ **全 DELETE** | ❌ **全 DELETE** | DocumentDeleted |
 
 ---
 
-## 六、关键设计决策解析
+## 七、关键设计决策解析
 
-### 6.1 库存为何采用动态计算而非字段保存？
+### 7.1 库存为何采用动态计算而非字段保存？
 
 **优点**：
 1. **避免并发更新冲突**：高并发场景下无需对 `items.quantity` 行锁
@@ -485,14 +663,25 @@ protected function updateDocument($transaction, $type)
 - 查询实时库存需聚合两个关联（bill_items + invoice_items），性能略差
 - 需配合索引优化：`document_items(item_id, type)` 复合索引
 
-### 6.2 Bill 与 Transaction 为何松耦合（事件驱动）？
+### 7.2 Bill 与 Transaction 为何松耦合（非事件驱动）？
 
-1. **权责清晰**：Bill 代表"应付/应收"（权责发生制），Transaction 代表"实收/实付"（收付实现制）
+**⚠️ 再次澄清**：采购付款**不使用** PaymentReceived 事件，而是直接调用 Job。销售发票的在线支付才使用事件。
+
+采购付款采用直接调用而非事件驱动的原因：
+1. **权责清晰**：Bill 代表"应付"（权责发生制），Transaction 代表"实付"（收付实现制）
 2. **灵活拆分**：一张 Bill 可分多次付款，每次产生独立 Transaction
-3. **可扩展**：模块可监听 PaymentReceived 事件做扩展（如发送通知、集成支付网关）
-4. **审计友好**：付款历史完整记录，与账单主数据分离
+3. **后台操作直接可靠**：后台手动添加支付是确定性操作，不需要事件解耦
+4. **事件用于在线支付**：PaymentReceived 事件是为在线支付网关回调设计的，需要异步处理
 
-### 6.3 费用入账的 category_id 继承链
+### 7.3 作废不删库存的设计考量
+
+作废（Cancel）只清除费用不清除库存的设计原因：
+1. **保留审计痕迹**：即使账单作废，商品的入库记录仍然存在，可追溯
+2. **业务语义**："作废"通常指"这笔采购取消了付款"，但货物可能已经入库
+3. **与删除区分**：如果需要彻底清除，使用 Delete 操作
+4. **可恢复性**：Cancel 后可 Restore，库存数据无需重新录入
+
+### 7.4 费用入账的 category_id 继承链
 
 ```
 Bill.category_id
@@ -511,21 +700,43 @@ Transaction.category_id
 
 ---
 
-## 七、关键源码位置索引
+## 八、容易混淆的概念对照表
+
+| 概念 | 所在表 | 含义 | 何时变化 |
+|------|--------|------|----------|
+| 应付账款 | `documents.amount` | 应该付给供应商多少钱 | 创建/修改 Bill 时 |
+| 已付金额 | `transactions.amount` 汇总 | 已经实际支付了多少钱 | 添加/删除支付时 |
+| 库存入库 | `document_items.quantity` (type=bill) | 采购了多少数量商品 | 创建/修改/删除 Bill 时 |
+| 费用记账 | `transactions` (type=expense) | 银行账户实际支出 | 添加/删除支付时 |
+| Bill 状态 | `documents.status` | 当前处于什么阶段 | 状态流转时 |
+
+**一句话区分**：
+- **document_items** 管"货"（库存多少）
+- **transactions** 管"钱"（花了多少钱）
+- **document.status** 管"单"（流程到哪一步）
+
+---
+
+## 九、关键源码位置索引
 
 | 层级 | 文件 | 核心职责 |
 |------|------|----------|
+| **配置** | [type.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/config/type.php) | 类型映射（bill→expense→increase） |
 | 控制器 | [Bills.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Http/Controllers/Purchases/Bills.php) | HTTP 入口（CRUD + 标记状态） |
-| 控制器 | [DocumentTransactions.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Http/Controllers/Modals/DocumentTransactions.php) | 支付模态框入口 |
+| 控制器 | [DocumentTransactions.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Http/Controllers/Modals/DocumentTransactions.php) | 付款模态框入口（采购付款主路径） |
 | 表单验证 | [Document.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Http/Requests/Document/Document.php) | quantity 表达式预处理 |
 | 工具函数 | [helpers.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Utilities/helpers.php#L433-L460) | `calculation_to_quantity()` |
 | **创建 Bill** | [CreateDocument.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Jobs/Document/CreateDocument.php) | 主流程编排 |
 | **明细+汇总** | [CreateDocumentItemsAndTotals.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Jobs/Document/CreateDocumentItemsAndTotals.php) | 遍历 items、建库存记录 |
 | **行计算** | [CreateDocumentItem.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Jobs/Document/CreateDocumentItem.php) | 折扣+5种税计算 |
+| **作废 Bill** | [CancelDocument.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Jobs/Document/CancelDocument.php) | 作废（删 transactions，保留 items） |
+| **删除 Bill** | [DeleteDocument.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Jobs/Document/DeleteDocument.php) | 删除（删 items + transactions） |
 | **创建支付** | [CreateBankingDocumentTransaction.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Jobs/Banking/CreateBankingDocumentTransaction.php) | 费用入账编排（含超额校验）|
 | **落地费用** | [CreateTransaction.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Jobs/Banking/CreateTransaction.php) | 写入 transactions (expense) |
 | Observer | [Transaction.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Observers/Transaction.php) | 删除支付时回滚 Bill 状态 |
 | 事件配置 | [Event.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Providers/Event.php) | 事件-监听器绑定表 |
+| 在线支付 | [PaymentController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Abstracts/Http/PaymentController.php#L170-L179) | PaymentReceived 事件触发（仅 Invoice） |
+| 视图 | [payment.blade.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/resources/views/modals/documents/payment.blade.php#L138) | type 隐藏字段 |
 | 模型 | [Document.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Models/Document/Document.php) | Bill/Invoice 统一模型 |
 | 模型 | [DocumentItem.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Models/Document/DocumentItem.php) | 明细行（quantity 承载） |
 | 模型 | [Item.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Models/Common/Item.php) | 商品（bill_items/invoice_items 关联） |
@@ -535,6 +746,6 @@ Transaction.category_id
 
 ---
 
-## 八、一句话总结
+## 十、一句话总结
 
-> **采购 Bill 创建时，`document_items.quantity` 即记录了库存入库；当用户触发支付（通过模态框或事件），`CreateBankingDocumentTransaction` Job 才会写入一条 `type = 'expense'` 的 Transaction 完成费用入账。二者通过事件驱动解耦，Bill 管应付，Transaction 管实付，document_items 管库存，三线并行又彼此关联。**
+> **采购 Bill 创建时，`document_items.quantity` 即记录了库存入库；当用户通过付款模态框手动添加支付时（走 DocumentTransactions 控制器 → CreateBankingDocumentTransaction Job，不经过 PaymentReceived 事件），才会写入一条 `type = 'expense'` 的 Transaction 完成费用入账。作废（Cancel）Bill 只清费用不清库存，删除（Delete）才会两者都清。库存类型、费用类型都由 `config/type.php` 配置决定，视图通过隐藏字段传入后端。**

@@ -513,12 +513,12 @@ $this->deleteRelationships($this->model, [
 | `documents` | 否（改状态） | status = 'cancelled' |
 | `document_items` | 否 | 库存记录保留 |
 | `document_totals` | 否 | 汇总记录保留 |
-| `transactions` | ✅ 是（物理删除） | 费用记账彻底清除 |
-| `recurring` | ✅ 是（物理删除） | 定期账单配置彻底删除 |
+| `transactions` | ✅ 是（软删除） | 设置 deleted_at，可 restore() 恢复 |
+| `recurring` | ✅ 是（软删除） | 设置 deleted_at，可 restore() 恢复 |
 | `histories` | 否 | 历史记录保留 |
 
 **对库存的影响**：❌ 无影响（document_items 保留，库存不变）
-**对费用的影响**：✅ 清除（transactions 物理删除，费用回退）
+**对费用的影响**：✅ 清除（transactions 软删除，费用回退，可恢复）
 
 ### 5.2 DeleteDocument（删除）
 
@@ -528,41 +528,59 @@ $this->deleteRelationships($this->model, [
 $this->deleteRelationships($this->model, [
     'items', 'item_taxes', 'histories', 'transactions', 'recurring', 'totals'
 ]);
-$this->model->delete();  // 物理删除
+$this->model->delete();  // 软删除（设置 deleted_at）
 ```
 
-**⚠️ 重要：删除语义为物理删除，不是软删除**
+**⚠️ 重要：删除语义为软删除，不是物理删除**
 
-代码证据：
-1. Document 模型 [Document.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Models/Document/Document.php#L22-L24) 的 trait 列表中**没有** `SoftDeletes`
-2. DocumentItem / DocumentTotal / DocumentHistory / Transaction / Item 等所有相关模型也均未使用 `SoftDeletes` trait
-3. 数据库迁移文件中 `documents`、`document_items`、`transactions` 等表**没有** `deleted_at` 字段
-4. `deleteRelationships()` 方法 [Relationships.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Traits/Relationships.php#L41-L69) 默认调用 `delete()`，在无 `SoftDeletes` 的模型上等同于 `forceDelete()`，即执行 SQL 的 `DELETE FROM`
-
+**1. 基础模型的软删除能力（代码证据）**：
+所有模型都通过继承抽象基类 [Model.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Abstracts/Model.php#L23) 获得 `SoftDeletes` trait：
 ```php
+// app/Abstracts/Model.php L23
+abstract class Model extends Eloquent implements Ownable
+{
+    use Cachable, DateTime, LaravelSearchString, Owners, SearchString, SoftDeletes, Sortable, Sources, Tenants;
+```
+→ Document、DocumentItem、DocumentTotal、DocumentHistory、DocumentItemTax、Transaction、Item、Recurring 等所有业务模型**均具备软删除能力**。
+
+**2. 数据库表均有 deleted_at 字段**：
+核心迁移文件中 `documents`、`document_items`、`document_totals`、`document_histories`、`document_item_taxes`、`transactions`、`items`、`recurring` 等表均通过 `$table->softDeletes()` 定义了 `deleted_at` 字段（如 [2017_09_14_000000_core_v1.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/database/migrations/2017_09_14_000000_core_v1.php#L56-L59)）。
+
+**3. deleteRelationships() 默认行为：调用普通删除（软删除）**：
+```php
+// Relationships.php L41
+public function deleteRelationships($model, $relationships, $permanently = false): void
+
 // Relationships.php L63-L66
 $function = $permanently ? 'forceDelete' : 'delete';
 foreach ((array) $items as $item) {
-    $item->$function();  // 无 SoftDeletes 时，delete() = 物理删除
+    $item->$function();  // 有 SoftDeletes 时，delete() = 软删除（设置 deleted_at）
 }
 ```
 
-**普通查询为何看不到删除记录**：
-- 不是被全局 Scope 过滤（Document 的全局 Scope [Scopes/Document.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Scopes/Document.php) 只排除定期模板，不处理 deleted_at）
-- 而是因为记录已通过 SQL `DELETE` 语句**从数据库表中物理移除**，无法通过常规查询找回，也无法通过 `withTrashed()` 恢复
+**4. 永久删除只在显式要求时触发**：
+- 只有调用 `deleteRelationships($model, $rels, true)` 才会走 `forceDelete` 分支，执行物理 `DELETE FROM`
+- [CancelDocument.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Jobs/Document/CancelDocument.php#L25-L27) 和 [DeleteDocument.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Jobs/Document/DeleteDocument.php#L24-L28) **都没有**传第三个参数 `$permanently = true`
+- 因此两者调用的都是 `delete()` → **软删除**
+
+**5. 普通查询为何看不到删除记录的真实原因**：
+- 原因是 **Laravel `SoftDeletes` trait 自动注册的全局 Scope**（`Illuminate\Database\Eloquent\SoftDeletingScope`）
+- 该 Scope 会在所有查询中自动追加 `WHERE deleted_at IS NULL`
+- [App\Scopes\Document](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Scopes/Document.php) 只是额外过滤定期模板，软删除过滤由 Eloquent 内核处理
+- 可通过 `withTrashed()` 查询软删记录，通过 `restore()` 恢复数据
 
 | 影响对象 | 是否删除 | 说明 |
 |----------|----------|------|
-| `documents` | ✅ 是（物理删除） | 直接 DELETE，无 deleted_at |
-| `document_items` | ✅ 是（物理删除） | 库存记录彻底删除 |
-| `document_totals` | ✅ 是（物理删除） | 汇总记录彻底删除 |
-| `document_item_taxes` | ✅ 是（物理删除） | 行税记录彻底删除 |
-| `transactions` | ✅ 是（物理删除） | 费用记账彻底清除 |
-| `recurring` | ✅ 是（物理删除） | 定期账单配置彻底删除 |
-| `histories` | ✅ 是（物理删除） | 历史记录彻底删除 |
+| `documents` | ✅ 是（软删除） | 设置 deleted_at，可 restore() 恢复 |
+| `document_items` | ✅ 是（软删除） | 设置 deleted_at，可 restore() 恢复 |
+| `document_totals` | ✅ 是（软删除） | 设置 deleted_at，可 restore() 恢复 |
+| `document_item_taxes` | ✅ 是（软删除） | 设置 deleted_at，可 restore() 恢复 |
+| `transactions` | ✅ 是（软删除） | 设置 deleted_at，可 restore() 恢复 |
+| `recurring` | ✅ 是（软删除） | 设置 deleted_at，可 restore() 恢复 |
+| `histories` | ✅ 是（软删除） | 设置 deleted_at，可 restore() 恢复 |
 
-**对库存的影响**：✅ 库存回退（document_items 物理删除）
-**对费用的影响**：✅ 清除（transactions 物理删除，费用回退）
+**对库存的影响**：✅ 库存回退（document_items 软删除，普通查询不包含）
+**对费用的影响**：✅ 清除（transactions 软删除，费用回退，可恢复）
 
 ### 5.3 对比总结
 
@@ -572,7 +590,7 @@ foreach ((array) $items as $item) {
 | 标记已收到 | 不变 | 不变 | received | 可回退到 draft |
 | 添加支付 | 不变 | ➕ 增加费用 | partial/paid | 可删除支付回退 |
 | 作废 (Cancel) | 不变 | ➖ 清除费用 | cancelled | 可恢复到 draft |
-| 删除 (Delete) | ➖ 减少 | ➖ 清除费用 | 物理删除 | ❌ 不可恢复（数据已物理清除） |
+| 删除 (Delete) | ➖ 减少 | ➖ 清除费用 | 软删除（deleted_at） | ✅ 可恢复（withTrashed() + restore()） |
 
 ---
 
@@ -814,7 +832,7 @@ public function apply(Builder $builder, Model $model)
 | partial | ✅ 存在 | ✅ 包含在关联结果中 | - |
 | paid | ✅ 存在 | ✅ 包含在关联结果中 | - |
 | cancelled | ✅ 存在 | ✅ 包含在关联结果中 | 作废不删 document_items |
-| 删除（物理删除） | ❌ 已不存在 | ❌ 不包含 | DeleteDocument 物理删除了 items 关系，数据已从数据库清除 |
+| 删除（软删除） | ❌ 已设置 deleted_at | ❌ 不包含（被 SoftDeletingScope 过滤） | DeleteDocument 软删除了 items 关系，withTrashed() 可查到 |
 
 **⚠️ 重要提示**：若需要在业务中准确统计库存，**必须主动过滤 draft/cancelled 状态**：
 
@@ -914,7 +932,7 @@ $current_stock = $item->bill_items()
 | 删除单条支付 (Observer) | `received`/`partial` | - | ❌ DELETE | ❌ 冲回该笔 | ✅ 不变（Bill 仍有效） | Observer deleted |
 | 取消 Bill (Cancel) | `cancelled` | -（保留）| ❌ 全 DELETE | ❌ 冲回 | ❌ 排除 | DocumentCancelled |
 | 恢复 Bill | `draft` | -（保留）| -（不恢复支付）| ❌ | ❌（draft 排除）| DocumentRestored |
-| 删除 Bill (Delete) | 物理删除 | ❌ 全 DELETE | ❌ 全 DELETE | ❌ 冲回 | ❌ 已物理删除 | DocumentDeleted |
+| 删除 Bill (Delete) | 软删除（deleted_at） | ❌ 全软删（普通查询不可见） | ❌ 全软删（普通查询不可见） | ❌ 冲回 | ❌ 已软删除 | DocumentDeleted |
 
 ---
 

@@ -1,12 +1,14 @@
 # 采购单据与库存增减、费用入账协作链路分析
 
-> 本文档基于 Akaunting v3.x 源码，深入分析采购账单（Bill）从创建到支付的全链路中，**库存增减记录**与**费用记账（Transaction）**是如何协作触发的。
+> 本文档基于 Akaunting v3.x 源码，深入分析采购账单（Bill）从创建到支付的全链路中，**库存增减记录**与**费用记账（Transaction）**是如何协作触发的，并区分现金制/权责发生制下的报表口径差异。
 >
-> **⚠️ 关键勘误（相比初版）：**
+> **⚠️ 关键勘误汇总：**
 > 1. `PaymentReceived` 事件**不在**采购付款路径上，它是销售发票在线支付专用
 > 2. 作废（Cancel）采购单**不影响**库存（document_items 保留），只有删除（Delete）才会清除库存记录
 > 3. 费用类型（expense/income）由 `config/type.php` 配置决定，通过付款模态框的隐藏字段传入
 > 4. `inventory_stock_action` 是配置预留项，核心代码未直接使用
+> 5. **核心版本不提供库存汇总展示功能**（由 Inventory 模块实现），`bill_items()`/`invoice_items()` 仅为关联方法
+> 6. **权责发生制报表**排除 draft/cancelled 状态 Bill，**现金制报表**只看 Transaction 不看 Bill
 
 ---
 
@@ -122,7 +124,7 @@ Schema::table('items', function(Blueprint $table) {
 
 ### 3.2 当前库存跟踪机制
 
-在 [Item.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Models/Common/Item.php#L74-L87) 中，模型提供了两个关键关联：
+在 [Item.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Models/Common/Item.php#L74-L87) 中，模型提供了两个关键关联方法：
 
 ```php
 public function bill_items()
@@ -136,7 +138,9 @@ public function invoice_items()
 }
 ```
 
-**库存动态计算公式**：
+**⚠️ 关键点**：这两个关联方法**没有过滤 Bill 状态**，即 draft/cancelled/received/partial/paid 状态的 Bill 对应的 document_items 都会被包含进来。是否排除草稿/作废取决于调用方是否主动加条件。
+
+**库存动态计算公式（理论）**：
 ```
 当前库存 = Σ(bill_items.quantity) - Σ(invoice_items.quantity)
 ```
@@ -145,7 +149,33 @@ public function invoice_items()
 - **采购入库**：创建 `type = 'bill'` 的 DocumentItem 时，`quantity` 字段记录了该商品的采购数量（正向增加）
 - **销售出库**：创建 `type = 'invoice'` 的 DocumentItem 时，`quantity` 为销售数量（负向减少）
 
-### 3.3 采购明细创建链路
+### 3.3 真实库存汇总入口：核心版本不提供库存展示
+
+**重要澄清**：Akaunting **核心版本（无模块）不提供库存数量展示功能**。
+
+证据：
+- Items 列表视图 [index.blade.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/resources/views/common/items/index.blade.php) 只展示：
+  - name（名称）
+  - description（描述）
+  - category（分类）
+  - taxes（税种）
+  - sale_price（销售价）
+  - purchase_price（采购价）
+  - **没有库存数量列**
+
+- Item 模型 [Item.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Models/Common/Item.php) 只定义了 `bill_items()` / `invoice_items()` 关联方法，但**没有提供聚合库存的访问器**（如 `getStockAttribute()`）
+
+**结论**：
+- `bill_items()` / `invoice_items()` 关联是为 **Inventory 模块（付费插件）** 预留的钩子
+- 若需自行统计库存，需手动调用：
+  ```php
+  $in = $item->bill_items()->sum('quantity');
+  $out = $item->invoice_items()->sum('quantity');
+  $stock = $in - $out;
+  ```
+- 且需要自行决定是否排除 `draft` / `cancelled` 状态的单据（建议通过 `whereHas('document', fn($q) => $q->accrued())` 过滤）
+
+### 3.4 采购明细创建链路
 
 `CreateDocumentItemsAndTotals` → 逐行调用 `CreateDocumentItem`
 
@@ -180,7 +210,7 @@ public function invoice_items()
 6. 写入 document_item_taxes 表
 ```
 
-### 3.4 写入 DocumentTotals：账单汇总
+### 3.5 写入 DocumentTotals：账单汇总
 
 明细处理完毕后，`CreateDocumentItemsAndTotals` 按 `sort_order` 写入 `document_totals` 表：
 
@@ -526,9 +556,273 @@ $this->model->delete();  // 软删除
 
 ---
 
-## 六、三者完整协作链路图
+## 六、报表口径：现金制 vs 权责发生制
 
-### 6.1 场景一：创建采购账单 → 确认收到 → 全额支付
+这是"采购费用如何进入报表"的核心代码分析。
+
+### 6.1 会计基础（Basis）过滤器
+
+报表的 basis 选项由 [AddBasis.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Listeners/Report/AddBasis.php#L10-L16) 注册到以下 5 类报表：
+
+```php
+protected $classes = [
+    'App\Reports\IncomeSummary',
+    'App\Reports\ExpenseSummary',      // ← 费用汇总报表
+    'App\Reports\IncomeExpenseSummary',
+    'App\Reports\ProfitLoss',          // ← 损益表/利润表（最常用）
+    'App\Reports\TaxSummary',
+];
+```
+
+**默认值**：`'accrual'`（权责发生制），在 [AddBasis.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Listeners/Report/AddBasis.php#L32) 中定义：
+
+```php
+$event->class->filters['defaults']['basis'] = $event->class->getSetting('basis', 'accrual');
+```
+
+### 6.2 scopeAccrued：关键的状态过滤器
+
+**权责发生制的核心过滤逻辑**在 [Document.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Models/Document/Document.php#L206-L209)：
+
+```php
+public function scopeAccrued(Builder $query): Builder
+{
+    return $query->whereNotIn($this->qualifyColumn('status'), ['draft', 'cancelled']);
+}
+```
+
+即：**权责发生制下，排除 `status = 'draft'`（草稿）和 `status = 'cancelled'`（作废）的采购单。**
+
+包含的状态：`received`、`partial`、`paid` —— 即所有"已经生效"的采购单，无论是否已付款。
+
+### 6.3 费用汇总报表（ExpenseSummary）的双路径实现
+
+[ExpenseSummary.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Reports/ExpenseSummary.php#L36-L66) 的 `setData()` 方法清晰展示了两种口径：
+
+```php
+switch ($this->getBasis()) {
+    case 'cash':
+        // 现金制：只看实际付款的 Transaction
+        $expenses = $this->applyFilters(
+            model: Transaction::with('recurring')->expense()->isNotTransfer(),
+            args: ['date_field' => 'paid_at', 'model_type' => 'expense'],
+        )->get();
+        $this->setTotals($expenses, 'paid_at', false, 'expense');
+        break;
+
+    default:  // accrual
+        // 权责发生制：看 Bill 本身（不管付没付款） + 独立费用 Transaction
+        $bills = $this->applyFilters(
+            model: Document::bill()->with('recurring', 'transactions', 'items')->accrued(),
+            args: ['date_field' => 'issued_at', 'model_type' => 'bill'],
+        )->get();
+        Recurring::reflect($bills, 'issued_at');
+        $this->setTotals($bills, 'issued_at', false, 'expense');
+
+        // 加上不关联单据的独立费用
+        $expenses = $transactions->isNotDocument()->get();
+        Recurring::reflect($expenses, 'paid_at');
+        $this->setTotals($expenses, 'paid_at', false, 'expense');
+        break;
+}
+```
+
+### 6.4 损益表（ProfitLoss）的完整实现
+
+[ProfitLoss.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Reports/ProfitLoss.php#L49-L113) 中最能体现两种口径的差异：
+
+#### 现金制（Basis = 'cash'）
+
+```php
+case 'cash':
+    // 收入：只有 income Transaction（按 paid_at 日期）
+    $incomes_query = $this->getTransactionQuery(Transaction::INCOME_TYPE);
+    $expenses_query = $this->getTransactionQuery(Transaction::EXPENSE_TYPE);
+    
+    // COGS（销售成本）：cogs 分类的 expense Transaction
+    $cogs_expenses = $cogs_expenses_query
+        ->whereHas('category', fn($q) => $q->cogs())
+        ->get();
+    
+    // 普通费用：非 cogs 分类的 expense Transaction
+    $expenses = $expenses_query
+        ->whereDoesntHave('category', fn($q) => $q->cogs())
+        ->get();
+    break;
+```
+
+**现金制特点**：
+- 数据源：**只有 `transactions` 表**（不看 `documents` 表）
+- 日期字段：`paid_at`（实际支付日期）
+- 采购费用进入报表的条件：**必须已经付款（有 Transaction 记录）**
+- draft/cancelled Bill：天然不计入（因为不会有 Transaction，即使有也会被作废时删除）
+- 未付款的 received/partial Bill：**不计入**（无 Transaction）
+
+#### 权责发生制（Basis = 'accrual'，默认）
+
+```php
+default:
+    $incomes_query    = $this->getTransactionQuery(Transaction::INCOME_TYPE);
+    $expenses_query   = $this->getTransactionQuery(Transaction::EXPENSE_TYPE);
+    $invoices_query   = $this->getDocumentQuery(Document::INVOICE_TYPE);
+    $bills_query      = $this->getDocumentQuery(Document::BILL_TYPE);  // ← 关键：直接查 Bill
+
+    // 1. 先处理 Invoice（按 issued_at）+ 独立 income Transaction（按 paid_at）
+    // ... 省略收入侧 ...
+
+    // 2. COGS（销售成本）：先查 Bill → 再查 Transaction
+    $cogs_bills = $bills_query  // ← 含 ->accrued()，排除 draft/cancelled
+        ->whereHas('category', fn($q) => $q->cogs())
+        ->get();
+    $this->setTotals($cogs_bills, 'issued_at', ...);
+
+    $cogs_expenses = $expenses_query
+        ->whereHas('category', fn($q) => $q->cogs())
+        ->get();
+
+    // 3. 费用：先查 Bill → 再查 Transaction
+    $bills = $bills_query  // ← 含 ->accrued()，排除 draft/cancelled
+        ->whereDoesntHave('category', fn($q) => $q->cogs())
+        ->get();
+    $this->setTotals($bills, 'issued_at', ...);  // ← 日期是 issued_at，不是 paid_at
+
+    $expenses = $expenses_query
+        ->whereDoesntHave('category', fn($q) => $q->cogs())
+        ->get();
+```
+
+**权责发生制特点**：
+- 数据源：**`documents` 表（Bill）+ `transactions` 表（独立费用）** 两部分
+- 日期字段：Bill 用 `issued_at`（账单日期），独立费用用 `paid_at`
+- 采购费用进入报表的条件：**Bill 状态非 draft 且非 cancelled**（不看是否付款）
+- draft/cancelled Bill：**通过 `scopeAccrued()` 排除**
+- 未付款的 received/partial Bill：**全额计入**（按 issued_at 日期）
+
+### 6.5 两种口径对比表
+
+| 维度 | 现金制（Cash） | 权责发生制（Accrual，默认） |
+|------|---------------|--------------------------|
+| 数据来源 | `transactions` 表 | `documents`（Bill） + `transactions`（独立费用） |
+| 采购日期 | `paid_at`（支付日） | `issued_at`（账单日） |
+| 计入条件 | 已实际付款 | Bill 状态 ∈ {received, partial, paid} |
+| draft 采购单 | ❌ 不计入 | ❌ 不计入（scopeAccrued 排除） |
+| cancelled 采购单 | ❌ 不计入（删 transactions） | ❌ 不计入（scopeAccrued 排除） |
+| received（未付款） | ❌ 不计入 | ✅ 全额计入 |
+| partial（部分付款） | ✅ 仅已付部分 | ✅ 全额计入（Bill.amount） |
+| paid（全额付款） | ✅ 按付款日期 | ✅ 按账单日期 |
+
+### 6.6 Dashboard 小部件的口径
+
+Dashboard 上的 [ProfitLoss Widget](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Widgets/ProfitLoss.php#L107-L122) 采用**固定的权责发生制逻辑**（无 basis 选项）：
+
+```php
+public function getExpense(): array
+{
+    // Bills：按 issued_at，含 accrued() 过滤
+    $query = Document::bill()->with(...)->accrued();
+    $bills = $this->applyFilters($query, ['date_field' => 'issued_at'])->get();
+    // ...
+
+    // Transactions：独立费用，按 paid_at
+    $query = Transaction::with('recurring')->expense()->isNotDocument()->isNotTransfer();
+    $transactions = $this->applyFilters($query, ['date_field' => 'paid_at'])->get();
+    // ...
+}
+```
+
+[CashFlow Widget](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Widgets/CashFlow.php#L157) 采用**固定的现金制逻辑**：
+
+```php
+$items = $this->applyFilters(
+    Transaction::$type()->whereBetween('paid_at', [...])->isNotTransfer()
+)->get();
+```
+
+[ExpensesByCategory Widget](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Widgets/ExpensesByCategory.php#L25-L30) 也是**现金制**：
+
+```php
+$this->applyFilters($category->expense_transactions)->each(function ($transaction) use (&$amount) {
+    $amount += $transaction->getAmountConvertedToDefault();
+});
+```
+
+### 6.7 Document 全局 Scope 说明
+
+需要区分 **全局 Scope** 和 **报表 Scope**：
+
+#### 全局 Scope [Scopes/Document.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Scopes/Document.php#L21-L24)
+
+```php
+public function apply(Builder $builder, Model $model)
+{
+    $this->applyNotRecurringScope($builder, $model);  // 只排除定期账单模板
+}
+```
+
+- 全局查询 Document 时**不会**自动排除 draft/cancelled
+- 只排除 `recurring`（定期账单的模板）
+- 所以：在非报表场景（如 Bill 列表页）可以看到所有状态的采购单
+
+#### 报表 Scope：`->accrued()`
+
+- 只在**权责发生制报表**中主动调用
+- 明确排除 draft/cancelled
+- 这是一个**局部 Scope**，不是全局的
+
+---
+
+## 七、草稿/作废采购单在各场景的处理差异汇总
+
+这是对全文最容易混淆的点的一张总表：
+
+### 7.1 费用报表场景
+
+| Bill 状态 | 现金制报表 | 权责发生制报表 | 原因 |
+|-----------|-----------|---------------|------|
+| draft | ❌ 不计入 | ❌ 不计入 | 现金：无 Transaction；权责：scopeAccrued 排除 |
+| received | ❌ 不计入 | ✅ 全额计入 | 现金：未付款无 Transaction；权责：非草稿非作废 |
+| partial | ✅ 已付部分 | ✅ 全额计入 | 现金：只记实际付款；权责：按 Bill 全额 |
+| paid | ✅ 全额 | ✅ 全额（按 issued_at） | 现金：按 paid_at；权责：按 issued_at |
+| cancelled | ❌ 不计入 | ❌ 不计入 | 现金：作废时删除了 Transaction；权责：scopeAccrued 排除 |
+
+### 7.2 库存明细场景
+
+| Bill 状态 | document_items 是否存在 | 对 bill_items() 关联的影响 | 说明 |
+|-----------|------------------------|--------------------------|------|
+| draft | ✅ 存在 | ✅ 包含在关联结果中 | 关联方法无状态过滤 |
+| received | ✅ 存在 | ✅ 包含在关联结果中 | - |
+| partial | ✅ 存在 | ✅ 包含在关联结果中 | - |
+| paid | ✅ 存在 | ✅ 包含在关联结果中 | - |
+| cancelled | ✅ 存在 | ✅ 包含在关联结果中 | 作废不删 document_items |
+| 删除（softDelete） | ❌ 已删除 | ❌ 不包含 | DeleteDocument 删除了 items 关系 |
+
+**⚠️ 重要提示**：若需要在业务中准确统计库存，**必须主动过滤 draft/cancelled 状态**：
+
+```php
+// 正确做法：按 Bill 状态过滤
+$current_stock = $item->bill_items()
+    ->whereHas('document', fn($q) => $q->accrued())  // 排除草稿和作废
+    ->sum('quantity')
+    -
+    $item->invoice_items()
+    ->whereHas('document', fn($q) => $q->accrued())
+    ->sum('quantity');
+```
+
+### 7.3 真实库存汇总入口
+
+| 场景 | 入口代码 | 是否展示库存 | 说明 |
+|------|---------|-------------|------|
+| Items 列表页 | [items/index.blade.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/resources/views/common/items/index.blade.php) | ❌ 不展示 | 仅显示价格、分类、税种 |
+| Item 模型 | [Item.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Models/Common/Item.php) | - | 提供 bill_items()/invoice_items() 关联，无聚合访问器 |
+| 核心报表 | Reports 目录下 | ❌ 无库存报表 | 只有收入/费用/利润/税 |
+| Inventory 模块 | modules/Inventory（**核心无此目录**） | ✅ 提供 | 付费模块实现 |
+
+---
+
+## 八、三者完整协作链路图
+
+### 8.1 场景一：创建采购账单 → 确认收到 → 全额支付
 
 ```
 用户操作: POST /purchases/bills
@@ -588,70 +882,25 @@ $this->model->delete();  // 软删除
   └─ (event) DocumentTransactionCreated
 ```
 
-### 6.2 场景二：作废采购账单 → 回滚费用（保留库存）
+### 8.2 数据联动汇总表（最终版）
 
-```
-用户操作: 点击「Cancel」
-  │
-  ▼
-[Bills::markCancelled]
-  │
-  ▼ (event) DocumentCancelled
-  │
-  ▼
-[MarkDocumentCancelled Listener]
-  │
-  ▼
-[CancelDocument Job] ─── DB Transaction ──────┐
-  ├─ deleteRelationships(['transactions', 'recurring'])
-  │   └─ DELETE FROM transactions WHERE document_id = ?
-  │      → 费用记录被撤销 ❌
-  │   (⚠️ 不删除 document_items，库存保留)
-  └─ bill.status = 'cancelled'
-```
-
-### 6.3 场景三：删除采购账单 → 库存和费用全部清除
-
-```
-用户操作: 点击「Delete」
-  │
-  ▼
-[Bills::destroy]
-  │
-  ▼
-[DeleteDocument Job] ─── DB Transaction ──────┐
-  ├─ Transaction::mute()  // 禁用 Observer，避免重复回写
-  ├─ deleteRelationships([
-  │     'items',         ← document_items 删除 → 库存回退 ❌
-  │     'item_taxes',
-  │     'histories',
-  │     'transactions',  ← 费用删除 ❌
-  │     'recurring',
-  │     'totals'
-  │ ])
-  ├─ $this->model->delete()  // 软删除
-  └─ Transaction::unmute()
-```
-
-### 6.4 数据联动汇总表（修正版）
-
-| 操作 | documents (status) | document_items (库存) | transactions (费用) | 触发事件 |
-|------|--------------------|----------------------|---------------------|----------|
-| 创建 Bill | `draft` | ✅ **INSERT** (入库) | - | DocumentCreated |
-| 标记已收到 | `received` | - | - | DocumentReceived |
-| 部分付款 | `partial` | - | ✅ **INSERT** (expense) | DocumentTransactionCreating / Created |
-| 再次付款（结清） | `paid` | - | ✅ **INSERT** | 同上 |
-| 修改 Bill | 不变 | ❌ **DELETE + REINSERT**（先删后重建） | -（若未对账） | DocumentUpdated |
-| 删除单条支付 (Observer) | `received`/`partial` | - | ❌ **DELETE** | (Observer deleted) |
-| 取消 Bill (Cancel) | `cancelled` | -（保留） | ❌ **全 DELETE** | DocumentCancelled |
-| 恢复 Bill | `draft` | -（保留） | -（不恢复支付） | DocumentRestored |
-| 删除 Bill (Delete) | softDelete | ❌ **全 DELETE** | ❌ **全 DELETE** | DocumentDeleted |
+| 操作 | documents (status) | document_items (库存) | transactions (费用) | 现金制费用报表 | 权责发生制费用报表 | 触发事件 |
+|------|--------------------|----------------------|---------------------|---------------|-----------------|----------|
+| 创建 Bill | `draft` | ✅ INSERT (入库) | - | ❌ | ❌ | DocumentCreated |
+| 标记已收到 | `received` | - | - | ❌ | ✅ 全额计入 | DocumentReceived |
+| 部分付款 | `partial` | - | ✅ INSERT (expense) | ✅ 已付部分 | ✅ 全额计入 | DocumentTransactionCreated |
+| 再次付款（结清） | `paid` | - | ✅ INSERT | ✅ 付款额 | ✅ 已计入 | DocumentTransactionCreated |
+| 修改 Bill | 不变 | DELETE + REINSERT | -（若未对账）| ❌ | ✅ 重新计算 | DocumentUpdated |
+| 删除单条支付 (Observer) | `received`/`partial` | - | ❌ DELETE | ❌ 冲回该笔 | ✅ 不变（Bill 仍有效） | Observer deleted |
+| 取消 Bill (Cancel) | `cancelled` | -（保留）| ❌ 全 DELETE | ❌ 冲回 | ❌ 排除 | DocumentCancelled |
+| 恢复 Bill | `draft` | -（保留）| -（不恢复支付）| ❌ | ❌（draft 排除）| DocumentRestored |
+| 删除 Bill (Delete) | softDelete | ❌ 全 DELETE | ❌ 全 DELETE | ❌ 冲回 | ❌ 删除 | DocumentDeleted |
 
 ---
 
-## 七、关键设计决策解析
+## 九、关键设计决策解析
 
-### 7.1 库存为何采用动态计算而非字段保存？
+### 9.1 库存为何采用动态计算而非字段保存？
 
 **优点**：
 1. **避免并发更新冲突**：高并发场景下无需对 `items.quantity` 行锁
@@ -662,8 +911,24 @@ $this->model->delete();  // 软删除
 **代价**：
 - 查询实时库存需聚合两个关联（bill_items + invoice_items），性能略差
 - 需配合索引优化：`document_items(item_id, type)` 复合索引
+- 调用方需要自行决定是否过滤 draft/cancelled 状态
 
-### 7.2 Bill 与 Transaction 为何松耦合（非事件驱动）？
+### 9.2 为何核心版本不提供库存汇总展示？
+
+**模块化设计**：
+1. Akaunting 核心定位为**财务会计系统**（收入/费用/税务），而非**库存管理系统**
+2. 库存管理（Warehouse/Inventory）作为**付费模块**独立提供
+3. 核心代码中预留 `bill_items()` / `invoice_items()` 关联和 `inventory_stock_action` 配置，供模块扩展
+4. 这种设计保持了核心的轻量，同时支持通过模块生态增强功能
+
+### 9.3 现金制 vs 权责发生制的会计依据
+
+- **现金制（Cash Basis）**：费用在实际支付时确认。符合小企业/个体户的简单记账需求，税务处理简单。
+- **权责发生制（Accrual Basis）**：费用在账单生效时（issued_at）确认，不论是否付款。符合 GAAP/IFRS 会计准则，是大多数国家企业报税的要求。
+
+Akaunting 默认采用权责发生制，体现了其面向企业级财务的定位。代码中通过 `scopeAccrued()` 对状态的精确过滤，确保了会计口径的严谨性。
+
+### 9.4 Bill 与 Transaction 为何松耦合（非事件驱动）？
 
 **⚠️ 再次澄清**：采购付款**不使用** PaymentReceived 事件，而是直接调用 Job。销售发票的在线支付才使用事件。
 
@@ -673,7 +938,7 @@ $this->model->delete();  // 软删除
 3. **后台操作直接可靠**：后台手动添加支付是确定性操作，不需要事件解耦
 4. **事件用于在线支付**：PaymentReceived 事件是为在线支付网关回调设计的，需要异步处理
 
-### 7.3 作废不删库存的设计考量
+### 9.5 作废不删库存的设计考量
 
 作废（Cancel）只清除费用不清除库存的设计原因：
 1. **保留审计痕迹**：即使账单作废，商品的入库记录仍然存在，可追溯
@@ -681,7 +946,7 @@ $this->model->delete();  // 软删除
 3. **与删除区分**：如果需要彻底清除，使用 Delete 操作
 4. **可恢复性**：Cancel 后可 Restore，库存数据无需重新录入
 
-### 7.4 费用入账的 category_id 继承链
+### 9.6 费用入账的 category_id 继承链
 
 ```
 Bill.category_id
@@ -700,13 +965,13 @@ Transaction.category_id
 
 ---
 
-## 八、容易混淆的概念对照表
+## 十、容易混淆的概念对照表
 
 | 概念 | 所在表 | 含义 | 何时变化 |
 |------|--------|------|----------|
 | 应付账款 | `documents.amount` | 应该付给供应商多少钱 | 创建/修改 Bill 时 |
 | 已付金额 | `transactions.amount` 汇总 | 已经实际支付了多少钱 | 添加/删除支付时 |
-| 库存入库 | `document_items.quantity` (type=bill) | 采购了多少数量商品 | 创建/修改/删除 Bill 时 |
+| 库存入库记录 | `document_items.quantity` (type=bill) | 采购了多少数量商品 | 创建/修改/删除 Bill 时 |
 | 费用记账 | `transactions` (type=expense) | 银行账户实际支出 | 添加/删除支付时 |
 | Bill 状态 | `documents.status` | 当前处于什么阶段 | 状态流转时 |
 
@@ -714,15 +979,21 @@ Transaction.category_id
 - **document_items** 管"货"（库存多少）
 - **transactions** 管"钱"（花了多少钱）
 - **document.status** 管"单"（流程到哪一步）
+- **scopeAccrued()** 管"账"（哪些能进权责发生制报表）
 
 ---
 
-## 九、关键源码位置索引
+## 十一、关键源码位置索引
 
 | 层级 | 文件 | 核心职责 |
 |------|------|----------|
 | **配置** | [type.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/config/type.php) | 类型映射（bill→expense→increase） |
-| 控制器 | [Bills.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Http/Controllers/Purchases/Bills.php) | HTTP 入口（CRUD + 标记状态） |
+| **报表** | [ExpenseSummary.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Reports/ExpenseSummary.php#L36-L66) | 费用汇总双口径实现 |
+| **报表** | [ProfitLoss.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Reports/ProfitLoss.php#L49-L113) | 损益表双口径实现（最全面） |
+| **报表** | [AddBasis.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Listeners/Report/AddBasis.php) | 注册现金/权责选项 |
+| **Scope** | [scopeAccrued](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Models/Document/Document.php#L206-L209) | 权责发生制排除 draft/cancelled |
+| **全局Scope** | [Document.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Scopes/Document.php) | 仅排除定期账单模板 |
+| **控制器** | [Bills.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Http/Controllers/Purchases/Bills.php) | HTTP 入口（CRUD + 标记状态） |
 | 控制器 | [DocumentTransactions.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Http/Controllers/Modals/DocumentTransactions.php) | 付款模态框入口（采购付款主路径） |
 | 表单验证 | [Document.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Http/Requests/Document/Document.php) | quantity 表达式预处理 |
 | 工具函数 | [helpers.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Utilities/helpers.php#L433-L460) | `calculation_to_quantity()` |
@@ -736,16 +1007,19 @@ Transaction.category_id
 | Observer | [Transaction.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Observers/Transaction.php) | 删除支付时回滚 Bill 状态 |
 | 事件配置 | [Event.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Providers/Event.php) | 事件-监听器绑定表 |
 | 在线支付 | [PaymentController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Abstracts/Http/PaymentController.php#L170-L179) | PaymentReceived 事件触发（仅 Invoice） |
+| **Widget** | [Widgets/ProfitLoss.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Widgets/ProfitLoss.php#L107-L122) | 仪表盘损益（权责发生制） |
+| **Widget** | [Widgets/CashFlow.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Widgets/CashFlow.php#L157) | 仪表盘现金流（现金制） |
 | 视图 | [payment.blade.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/resources/views/modals/documents/payment.blade.php#L138) | type 隐藏字段 |
 | 模型 | [Document.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Models/Document/Document.php) | Bill/Invoice 统一模型 |
 | 模型 | [DocumentItem.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Models/Document/DocumentItem.php) | 明细行（quantity 承载） |
 | 模型 | [Item.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Models/Common/Item.php) | 商品（bill_items/invoice_items 关联） |
 | 模型 | [Transaction.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Models/Banking/Transaction.php) | 收支流水（expense 费用） |
+| 视图 | [items/index.blade.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/resources/views/common/items/index.blade.php) | 商品列表（不显示库存） |
 | 迁移文件 | [2022_05_10_000000_core_v300.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/database/migrations/2022_05_10_000000_core_v300.php#L37-L43) | 删除 items.quantity 的关键迁移 |
 | 测试 | [BillsTest.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/tests/Feature/Purchases/BillsTest.php) | 采购+支付的集成测试 |
 
 ---
 
-## 十、一句话总结
+## 十二、一句话总结
 
-> **采购 Bill 创建时，`document_items.quantity` 即记录了库存入库；当用户通过付款模态框手动添加支付时（走 DocumentTransactions 控制器 → CreateBankingDocumentTransaction Job，不经过 PaymentReceived 事件），才会写入一条 `type = 'expense'` 的 Transaction 完成费用入账。作废（Cancel）Bill 只清费用不清库存，删除（Delete）才会两者都清。库存类型、费用类型都由 `config/type.php` 配置决定，视图通过隐藏字段传入后端。**
+> **采购 Bill 创建时写入 document_items 记录库存（所有状态都保留，核心版本不提供库存汇总展示由模块实现）；付款模态框直接调用 CreateBankingDocumentTransaction Job 写入 expense Transaction 完成费用入账；现金制报表只看 Transaction（paid_at 日期），权责发生制报表通过 `scopeAccrued()` 排除 draft/cancelled 的 Bill 后按 issued_at 全额计入，无论是否付款。**

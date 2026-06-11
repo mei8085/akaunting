@@ -7,7 +7,7 @@
 > 2. 作废（Cancel）采购单**不影响**库存（document_items 保留），只有删除（Delete）才会清除库存记录
 > 3. 费用类型（expense/income）由 `config/type.php` 配置决定，通过付款模态框的隐藏字段传入
 > 4. `inventory_stock_action` 是配置预留项，核心代码未直接使用
-> 5. **核心版本不提供库存汇总展示功能**（由 Inventory 模块实现），`bill_items()`/`invoice_items()` 仅为关联方法
+> 5. **核心版本不提供库存汇总展示功能**（核心代码无 `modules/Inventory` 目录，Items 列表视图无库存列，Item 模型无库存聚合访问器），`bill_items()`/`invoice_items()` 仅为关联方法
 > 6. **权责发生制报表**排除 draft/cancelled 状态 Bill，**现金制报表**只看 Transaction 不看 Bill
 
 ---
@@ -166,7 +166,7 @@ public function invoice_items()
 - Item 模型 [Item.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Models/Common/Item.php) 只定义了 `bill_items()` / `invoice_items()` 关联方法，但**没有提供聚合库存的访问器**（如 `getStockAttribute()`）
 
 **结论**：
-- `bill_items()` / `invoice_items()` 关联是为 **Inventory 模块（付费插件）** 预留的钩子
+- `bill_items()` / `invoice_items()` 关联是**代码层面的扩展钩子**（核心代码中未被用于聚合库存展示）
 - 若需自行统计库存，需手动调用：
   ```php
   $in = $item->bill_items()->sum('quantity');
@@ -513,12 +513,12 @@ $this->deleteRelationships($this->model, [
 | `documents` | 否（改状态） | status = 'cancelled' |
 | `document_items` | 否 | 库存记录保留 |
 | `document_totals` | 否 | 汇总记录保留 |
-| `transactions` | ✅ 是 | 费用记账被清除 |
-| `recurring` | ✅ 是 | 定期账单配置删除 |
+| `transactions` | ✅ 是（物理删除） | 费用记账彻底清除 |
+| `recurring` | ✅ 是（物理删除） | 定期账单配置彻底删除 |
 | `histories` | 否 | 历史记录保留 |
 
 **对库存的影响**：❌ 无影响（document_items 保留，库存不变）
-**对费用的影响**：✅ 清除（transactions 删除，费用回退）
+**对费用的影响**：✅ 清除（transactions 物理删除，费用回退）
 
 ### 5.2 DeleteDocument（删除）
 
@@ -528,21 +528,41 @@ $this->deleteRelationships($this->model, [
 $this->deleteRelationships($this->model, [
     'items', 'item_taxes', 'histories', 'transactions', 'recurring', 'totals'
 ]);
-$this->model->delete();  // 软删除
+$this->model->delete();  // 物理删除
 ```
+
+**⚠️ 重要：删除语义为物理删除，不是软删除**
+
+代码证据：
+1. Document 模型 [Document.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Models/Document/Document.php#L22-L24) 的 trait 列表中**没有** `SoftDeletes`
+2. DocumentItem / DocumentTotal / DocumentHistory / Transaction / Item 等所有相关模型也均未使用 `SoftDeletes` trait
+3. 数据库迁移文件中 `documents`、`document_items`、`transactions` 等表**没有** `deleted_at` 字段
+4. `deleteRelationships()` 方法 [Relationships.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Traits/Relationships.php#L41-L69) 默认调用 `delete()`，在无 `SoftDeletes` 的模型上等同于 `forceDelete()`，即执行 SQL 的 `DELETE FROM`
+
+```php
+// Relationships.php L63-L66
+$function = $permanently ? 'forceDelete' : 'delete';
+foreach ((array) $items as $item) {
+    $item->$function();  // 无 SoftDeletes 时，delete() = 物理删除
+}
+```
+
+**普通查询为何看不到删除记录**：
+- 不是被全局 Scope 过滤（Document 的全局 Scope [Scopes/Document.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Scopes/Document.php) 只排除定期模板，不处理 deleted_at）
+- 而是因为记录已通过 SQL `DELETE` 语句**从数据库表中物理移除**，无法通过常规查询找回，也无法通过 `withTrashed()` 恢复
 
 | 影响对象 | 是否删除 | 说明 |
 |----------|----------|------|
-| `documents` | ✅ 是（软删） | deleted_at 标记 |
-| `document_items` | ✅ 是 | 库存记录删除 |
-| `document_totals` | ✅ 是 | 汇总记录删除 |
-| `document_item_taxes` | ✅ 是 | 行税记录删除 |
-| `transactions` | ✅ 是 | 费用记账被清除 |
-| `recurring` | ✅ 是 | 定期账单配置删除 |
-| `histories` | ✅ 是 | 历史记录删除 |
+| `documents` | ✅ 是（物理删除） | 直接 DELETE，无 deleted_at |
+| `document_items` | ✅ 是（物理删除） | 库存记录彻底删除 |
+| `document_totals` | ✅ 是（物理删除） | 汇总记录彻底删除 |
+| `document_item_taxes` | ✅ 是（物理删除） | 行税记录彻底删除 |
+| `transactions` | ✅ 是（物理删除） | 费用记账彻底清除 |
+| `recurring` | ✅ 是（物理删除） | 定期账单配置彻底删除 |
+| `histories` | ✅ 是（物理删除） | 历史记录彻底删除 |
 
-**对库存的影响**：✅ 库存回退（document_items 删除）
-**对费用的影响**：✅ 清除（transactions 删除，费用回退）
+**对库存的影响**：✅ 库存回退（document_items 物理删除）
+**对费用的影响**：✅ 清除（transactions 物理删除，费用回退）
 
 ### 5.3 对比总结
 
@@ -552,7 +572,7 @@ $this->model->delete();  // 软删除
 | 标记已收到 | 不变 | 不变 | received | 可回退到 draft |
 | 添加支付 | 不变 | ➕ 增加费用 | partial/paid | 可删除支付回退 |
 | 作废 (Cancel) | 不变 | ➖ 清除费用 | cancelled | 可恢复到 draft |
-| 删除 (Delete) | ➖ 减少 | ➖ 清除费用 | 软删除 | 可恢复（软删除） |
+| 删除 (Delete) | ➖ 减少 | ➖ 清除费用 | 物理删除 | ❌ 不可恢复（数据已物理清除） |
 
 ---
 
@@ -794,7 +814,7 @@ public function apply(Builder $builder, Model $model)
 | partial | ✅ 存在 | ✅ 包含在关联结果中 | - |
 | paid | ✅ 存在 | ✅ 包含在关联结果中 | - |
 | cancelled | ✅ 存在 | ✅ 包含在关联结果中 | 作废不删 document_items |
-| 删除（softDelete） | ❌ 已删除 | ❌ 不包含 | DeleteDocument 删除了 items 关系 |
+| 删除（物理删除） | ❌ 已不存在 | ❌ 不包含 | DeleteDocument 物理删除了 items 关系，数据已从数据库清除 |
 
 **⚠️ 重要提示**：若需要在业务中准确统计库存，**必须主动过滤 draft/cancelled 状态**：
 
@@ -816,7 +836,7 @@ $current_stock = $item->bill_items()
 | Items 列表页 | [items/index.blade.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/resources/views/common/items/index.blade.php) | ❌ 不展示 | 仅显示价格、分类、税种 |
 | Item 模型 | [Item.php](file:///d:/fz/0508-2/solo-dogfeeding/code/130-akaunting/app/Models/Common/Item.php) | - | 提供 bill_items()/invoice_items() 关联，无聚合访问器 |
 | 核心报表 | Reports 目录下 | ❌ 无库存报表 | 只有收入/费用/利润/税 |
-| Inventory 模块 | modules/Inventory（**核心无此目录**） | ✅ 提供 | 付费模块实现 |
+| 扩展模块 | modules/Inventory（**核心仓库无此目录**）| - | 仅能确认核心代码未实现，不讨论外部模块实现细节 |
 
 ---
 
@@ -894,7 +914,7 @@ $current_stock = $item->bill_items()
 | 删除单条支付 (Observer) | `received`/`partial` | - | ❌ DELETE | ❌ 冲回该笔 | ✅ 不变（Bill 仍有效） | Observer deleted |
 | 取消 Bill (Cancel) | `cancelled` | -（保留）| ❌ 全 DELETE | ❌ 冲回 | ❌ 排除 | DocumentCancelled |
 | 恢复 Bill | `draft` | -（保留）| -（不恢复支付）| ❌ | ❌（draft 排除）| DocumentRestored |
-| 删除 Bill (Delete) | softDelete | ❌ 全 DELETE | ❌ 全 DELETE | ❌ 冲回 | ❌ 删除 | DocumentDeleted |
+| 删除 Bill (Delete) | 物理删除 | ❌ 全 DELETE | ❌ 全 DELETE | ❌ 冲回 | ❌ 已物理删除 | DocumentDeleted |
 
 ---
 
@@ -916,10 +936,10 @@ $current_stock = $item->bill_items()
 ### 9.2 为何核心版本不提供库存汇总展示？
 
 **模块化设计**：
-1. Akaunting 核心定位为**财务会计系统**（收入/费用/税务），而非**库存管理系统**
-2. 库存管理（Warehouse/Inventory）作为**付费模块**独立提供
-3. 核心代码中预留 `bill_items()` / `invoice_items()` 关联和 `inventory_stock_action` 配置，供模块扩展
-4. 这种设计保持了核心的轻量，同时支持通过模块生态增强功能
+1. Akaunting 核心代码定位为**财务会计系统**（收入/费用/税务），不包含库存汇总展示功能
+2. `modules/` 目录在本仓中**不存在**，无法确认外部模块实现细节
+3. 核心代码中预留了 `bill_items()` / `invoice_items()` 关联方法和 `inventory_stock_action` 配置项，但核心代码本身**未使用**这些来做库存聚合展示
+4. 上述钩子为二次开发提供了扩展点
 
 ### 9.3 现金制 vs 权责发生制的会计依据
 

@@ -956,3 +956,526 @@ app('events')->listen(JobProcessing::class, function ($event) {
 | **主表 `new Model($row)`** | ❌ 无事务 | 依赖 Eloquent 的 `$fillable` 批量赋值，单行单次 INSERT |
 | **导出** | N/A | 只读操作，无需事务 |
 | **队列上下文** | `company_id` 注入 | 保证多租户隔离，不控制事务但更基础 |
+
+---
+
+## 十一、WithValidation 批量插入时机的源码级验证
+
+### 11.1 问题："chunk 验证完成才批量插入" 这条断言是否正确？
+
+**答案：完全正确。** 让我们沿着 vendor 源码的调用链路逐层确认。
+
+### 11.2 完整调用链路（ReadChunk → Sheet → ModelImporter → ModelManager）
+
+```
+ReadChunk::handle(TransactionHandler $transaction)
+  ↓
+$transaction(function () use ($sheet) {
+    $sheet->import($this->sheetImport, $this->startRow);  // ← 整个 chunk 在事务内
+    ...
+});
+  ↓
+Sheet::import($import, $startRow)
+  ↓
+if ($import instanceof ToModel) {
+    app(ModelImporter::class)->import($this->worksheet, $import, $startRow);
+}
+  ↓
+ModelImporter::import(Worksheet $worksheet, ToModel $import, int $startRow)
+  ↓ (逐行读取)
+foreach ($worksheet->getRowIterator(...) as $spreadSheetRow) {
+    // ... map() + prepareForValidation() 处理
+    $this->manager->add($row->getIndex(), $rowArray);  // ← 先 add 到内存数组
+    if (($i % $batchSize) === 0) {
+        $this->flush($import, $batchSize, $batchStartRow);  // ← 凑够一个 batch 才 flush
+    }
+}
+if ($i > 0) { $this->flush(...); }  // ← 处理剩余行
+  ↓
+ModelManager::flush(ToModel $import, bool $massInsert = false)
+  ↓
+// ✅ 关键顺序：先 validate，再 flush
+if ($import instanceof WithValidation) {
+    $this->validateRows($import);  // ← 第一步：验证整批 rows
+}
+if ($massInsert) {
+    $this->massFlush($import);     // ← 第二步：批量插入（验证通过才执行）
+} else {
+    $this->singleFlush($import);   // ← 或单条插入
+}
+```
+
+### 11.3 ModelManager::flush() 源码佐证
+
+[ModelManager.php](https://github.com/SpartnerNL/Laravel-Excel/blob/3.1/src/Imports/ModelManager.php#L77-L97) 中的核心代码：
+
+```php
+public function flush(ToModel $import, bool $massInsert = false)
+{
+    if ($import instanceof WithValidation) {
+        $this->validateRows($import);  // 1️⃣ 先验证
+    }
+
+    if ($massInsert) {
+        $this->massFlush($import);     // 2️⃣ 验证通过才批量插入
+    } else {
+        $this->singleFlush($import);   // 2️⃣ 或单条插入
+    }
+
+    $this->rows = [];
+}
+```
+
+**验证失败的后果：** `validateRows()` 会调用 `$this->validator->validate($this->rows, $import)`，如果验证不通过会抛 `ValidationException`，后续的 `massFlush()` / `singleFlush()` 代码**永远不会执行**。因此该 chunk 内的所有行都不会被插入。
+
+### 11.4 事务边界的双重保障
+
+注意 `ReadChunk::handle()` 中的代码：
+
+```php
+$transaction(function () use ($sheet) {
+    $sheet->import($this->sheetImport, $this->startRow);
+    $sheet->disconnect();
+    $this->cleanUpTempFile();
+    $sheet->raise(new AfterChunk($sheet, $this->import, $this->startRow));
+});
+```
+
+[DbTransactionHandler](https://raw.githubusercontent.com/SpartnerNL/Laravel-Excel/3.1/src/Transactions/DbTransactionHandler.php) 实现：
+
+```php
+public function __invoke(callable $callback)
+{
+    return $this->connection->transaction($callback);
+}
+```
+
+这意味着**每个 chunk 在一个数据库事务中执行**：
+- 如果验证失败抛异常 → 事务回滚 → 整个 chunk 的插入全部撤销
+- 如果验证通过但插入时出错（如数据库约束）→ 事务回滚 → 整个 chunk 撤销
+- 如果全部成功 → 事务提交 → 整个 chunk 持久化
+
+**这是之前分析遗漏的关键点：** Maatwebsite 本身为每个 chunk 包裹了 `DB::transaction`，但这是 chunk 级事务，不是整个导入的全局事务。
+
+---
+
+## 十二、chunk 内单行验证失败的处理策略
+
+### 12.1 两种策略：整 chunk 跳过 vs 仅跳过失败行
+
+处理策略取决于 Import 类是否实现了 `SkipsOnFailure` 接口：
+
+| 实现接口 | 行为 |
+|----------|------|
+| **未实现 SkipsOnFailure** | 整 chunk 失败，全部跳过 |
+| **实现 SkipsOnFailure** | 仅移除失败行，其余行继续插入 |
+
+### 12.2 策略一：未实现 SkipsOnFailure → 整 chunk 跳过
+
+[RowValidator::validate()](https://raw.githubusercontent.com/SpartnerNL/Laravel-Excel/3.1/src/Validators/RowValidator.php#L22-L68) 源码：
+
+```php
+public function validate(array $rows, WithValidation $import)
+{
+    // ... 准备 rules, messages, attributes
+    try {
+        $validator = $this->validator->make($rows, $rules, $messages, $attributes);
+        if (method_exists($import, 'withValidator')) {
+            $import->withValidator($validator);
+        }
+        $validator->validate();  // 批量验证所有行
+    } catch (IlluminateValidationException $e) {
+        // ... 构造 failures 数组
+        if ($import instanceof SkipsOnFailure) {
+            $import->onFailure(...$failures);
+            throw new RowSkippedException(...$failures);  // ← 跳过异常
+        }
+        throw new ValidationException($e, $failures);  // ← 普通异常 → 终止整个 chunk
+    }
+}
+```
+
+当没有实现 `SkipsOnFailure` 时，抛出普通 `ValidationException`，冒泡到 `ReadChunk::handle()` 的 `$transaction()` 回调中，导致事务回滚，**整个 chunk 的所有行都不会插入**。
+
+### 12.3 策略二：实现 SkipsOnFailure → 仅跳过失败行
+
+[ModelManager::validateRows()](https://github.com/SpartnerNL/Laravel-Excel/blob/3.1/src/Imports/ModelManager.php#L197-L208) 源码：
+
+```php
+private function validateRows(WithValidation $import)
+{
+    try {
+        $this->validator->validate($this->rows, $import);
+    } catch (RowSkippedException $e) {
+        foreach ($e->skippedRows() as $row) {
+            unset($this->rows[$row]);  // ← 只移除失败行，保留其他行
+        }
+    }
+}
+```
+
+[SkipsOnFailure 接口](https://raw.githubusercontent.com/SpartnerNL/Laravel-Excel/3.1/src/Concerns/SkipsOnFailure.php)：
+
+```php
+interface SkipsOnFailure
+{
+    public function onFailure(Failure ...$failures);
+}
+```
+
+**完整流程：**
+1. `RowValidator` 发现验证错误，检测到 `$import instanceof SkipsOnFailure`
+2. 先调用 `$import->onFailure(...$failures)` 回调（用于记录日志或通知）
+3. 抛出 `RowSkippedException`（而非普通 `ValidationException`）
+4. `ModelManager::validateRows()` 捕获 `RowSkippedException`
+5. 从 `$this->rows` 数组中 `unset` 掉失败的行号
+6. 继续执行 `massFlush()` / `singleFlush()`，插入剩余的成功行
+
+### 12.4 项目中的实际情况
+
+[Abstracts/Import.php](file:///d:/fz/0601-1/solo-dogfeeding/code/26-akaunting/app/Abstracts/Import.php) 的类签名：
+
+```php
+abstract class Import implements 
+    HasLocalePreference,
+    ShouldQueue,
+    SkipsEmptyRows,
+    WithChunkReading,
+    WithHeadingRow,
+    WithLimit,
+    WithMapping,
+    WithValidation,  // ✅ 有验证
+    ToModel
+{
+    // ❌ 没有 implements SkipsOnFailure
+```
+
+项目中的 Import 抽象类**没有**实现 `SkipsOnFailure` 接口。因此项目中导入的行为是：
+> chunk 内任意一行验证失败 → 整个 chunk 全部跳过，不插入任何行 → 异常冒泡到 `ReadChunk::handle()` → 事务回滚 → `JobFailed` 事件触发 → 用户收到错误通知
+
+### 12.5 修正之前的断言
+
+**之前的错误断言：** "Maatwebsite 内部管理：验证失败则整 chunk 跳过插入"
+
+**修正后的准确描述：**
+> 当 Import 类 **未实现** `SkipsOnFailure` 时（本项目的情况），chunk 内任意一行验证失败 → `ValidationException` → 事务回滚 → **整个 chunk 的所有行都不会插入**。
+>
+> 当 Import 类 **实现** `SkipsOnFailure` 时，验证失败的行会被 `unset` 从插入数组中移除，**其余行会正常插入**。
+
+---
+
+## 十三、ValidationException::failures() 字段填充位置追踪
+
+### 13.1 Failure 对象的四个字段
+
+[Failure.php](https://raw.githubusercontent.com/SpartnerNL/Laravel-Excel/3.1/src/Validators/Failure.php) 定义了四个字段：
+
+```php
+class Failure implements Arrayable, JsonSerializable
+{
+    protected $row;        // 行号
+    protected $attribute;  // 字段名
+    protected $errors;     // 错误消息数组
+    private $values;       // 该行的所有值
+```
+
+### 13.2 填充位置：RowValidator，而非 ChunkReader
+
+**所有字段都在 [RowValidator::validate()](https://raw.githubusercontent.com/SpartnerNL/Laravel-Excel/3.1/src/Validators/RowValidator.php#L40-L63) 的 catch 块中解析和填充：**
+
+```php
+catch (IlluminateValidationException $e) {
+    $failures = [];
+    foreach ($e->errors() as $attribute => $messages) {
+        // 1️⃣ 解析行号和字段名
+        // $attribute 格式如 "5.name" 或 "5.email"
+        $row           = strtok($attribute, '.');   // 取点号前的部分 → "5"
+        $attributeName = strtok('');                // 取点号后的部分 → "name"
+        
+        // 2️⃣ 用自定义属性名替换（如果有）
+        // $attributes 数组格式如 ["*.name" => "商品名称"]
+        $attributeName = $attributes['*.' . $attributeName] ?? $attributeName;
+
+        // 3️⃣ 创建 Failure 对象，传入所有字段
+        $failures[] = new Failure(
+            (int) $row,                          // row: 转换为整数
+            $attributeName,                      // attribute: 字段名
+            str_replace($attribute, $attributeName, $messages),  // errors: 替换消息中的占位符
+            $rows[$row] ?? []                    // values: 该行的原始数据
+        );
+    }
+
+    // ... 根据是否 SkipsOnFailure 抛不同异常
+    throw new ValidationException($e, $failures);  // ← failures 传入异常
+}
+```
+
+### 13.3 各字段的来源详解
+
+| 字段 | 来源 | 解析逻辑 |
+|------|------|----------|
+| **row** | `$e->errors()` 的数组 key | Laravel Validator 返回的错误 key 格式为 `"{row_index}.{attribute}"`（如 `"5.name"`），用 `strtok($attribute, '.')` 切分得到行号 |
+| **attribute** | 同 key 的后半部分 + `customValidationAttributes()` | 切分得到字段名，再用自定义属性名数组 `$attributes['*.' . $attributeName]` 做替换（如 `name` → `商品名称`） |
+| **errors** | `$e->errors()` 的 value + `customValidationMessages()` | 原始错误消息数组，将其中的 `$attribute` 占位符替换为友好字段名 |
+| **values** | `$rows[$row]` | 该行经过 `map()` 和 `prepareForValidation()` 处理后的完整数据数组 |
+
+### 13.4 为什么是 RowValidator 而不是 ChunkReader？
+
+- **ChunkReader** 负责将大文件切成多个 chunk 并分发给队列 Job，它不关心每行的验证结果
+- **ReadChunk Job** 负责读取一个 chunk 的数据，但验证逻辑完全委托给 `RowValidator`
+- **RowValidator** 是验证的实际执行者，它调用 Laravel 的 `Validator::make()` 批量验证所有行，然后解析验证错误生成 `Failure` 对象
+- **ChunkReader** 甚至不知道 `Failure` 类的存在，两者职责完全分离
+
+### 13.5 ValidationException 的构造
+
+[ValidationException.php](https://raw.githubusercontent.com/SpartnerNL/Laravel-Excel/3.1/src/Validators/ValidationException.php) 只是一个简单的包装器：
+
+```php
+class ValidationException extends IlluminateValidationException
+{
+    protected $failures;
+
+    public function __construct(IlluminateValidationException $previous, array $failures)
+    {
+        parent::__construct($previous->validator, $previous->response, $previous->errorBag);
+        $this->failures = $failures;  // 直接保存 failures 数组
+    }
+
+    public function failures(): array
+    {
+        return $this->failures;  // 对外暴露
+    }
+}
+```
+
+### 13.6 行号的计算细节
+
+需要注意的是，Laravel Validator 验证时传入的 `$rows` 数组的 key 就是**原始 Excel 行号**（从 1 开始，含表头行）。这是因为在 `ModelImporter::import()` 中：
+
+```php
+$this->manager->add(
+    $row->getIndex(),  // ← 原始 Excel 行号（如 5）
+    $rowArray
+);
+```
+
+`$row->getIndex()` 返回的是 PhpSpreadsheet 中的原始行号（表头行为 1，数据从第 2 行开始），所以最终 `Failure::row()` 返回的行号可以直接定位到 Excel 文件中的行，无需额外计算偏移。
+
+---
+
+## 十四、Sources Trait 深度分析：导入数据来源缓存与事务边界
+
+### 14.1 Sources Trait 的完整源码
+
+[Sources.php](file:///d:/fz/0601-1\solo-dogfeeding\code\26-akaunting\app\Traits\Sources.php) 源码：
+
+```php
+trait Sources
+{
+    public function isSourcable(): bool
+    {
+        $sourcable = $this->sourcable ?? true;
+        return ($sourcable === true) && in_array('created_from', $this->getFillable());
+    }
+
+    public function getSourceName($request = null, $alias = null): string
+    {
+        $prefix = $this->getSourcePrefix($alias);
+
+        if (app()->runningInConsole()) {
+            $source = $prefix . 'console';
+        }
+
+        if (empty($source)) {
+            $request = $request ?: request();
+            if ($request instanceof QueueCollection || running_in_queue()) {
+                $source = $prefix . 'queue';
+            } else {
+                $source = $request->isApi() ? $prefix . 'api' : null;
+            }
+        }
+
+        if (empty($source)) {
+            $source = $prefix . 'ui';
+        }
+
+        return $source;
+    }
+
+    public function getSourcePrefix($alias = null)
+    {
+        $alias = is_null($alias) ? $this->getSourceAlias() : $alias;
+        return $alias . '::';
+    }
+
+    public function getSourceAlias()
+    {
+        $namespaces = explode('\\', get_class($this));
+        if ($namespaces[0] != 'Modules') {
+            return 'core';  // 核心模块
+        }
+        return Str::kebab($namespaces[1]);  // 模块名转 kebab-case
+    }
+}
+```
+
+### 14.2 在 Import 抽象类中的使用位置
+
+[Abstracts/Import.php](file:///d:/fz/0601-1/solo-dogfeeding/code/26-akaunting/app/Abstracts/Import.php#L44-L55)：
+
+```php
+abstract class Import implements ...
+{
+    use Importable, ImportHelper, Sources;  // ← use 了 Sources Trait
+```
+
+在 `map()` 方法中使用：
+
+```php
+public function map($row): array
+{
+    $row['company_id'] = company_id();
+    $row['created_by'] = $this->getCreatedById($row);
+    $row['created_from'] = $this->getSourcePrefix() . 'import';  // ← 设置来源标记
+    // ... 其他字段处理
+    return $row;
+}
+```
+
+### 14.3 Sources Trait 的核心作用
+
+**作用一：给数据打来源标签，用于审计追踪**
+
+| 调用场景 | 生成的 created_from 值 |
+|----------|------------------------|
+| Web UI 导入 | `core::import` |
+| API 导入 | `core::api` |
+| 队列导入 | `core::queue` |
+| 命令行导入 | `core::console` |
+| 模块（如 Sales）中的导入 | `sales::import` |
+
+**作用二：全局辅助函数 `source_name()` 的实现基础**
+
+[helpers.php:150-155](file:///d:/fz/0601-1/solo-dogfeeding/code/26-akaunting/app/Utilities/helpers.php#L150-L155)：
+
+```php
+function source_name(string|null $alias = null): string
+{
+    $tmp = new class() { use Sources; };
+    return $tmp->getSourceName(null, $alias);
+}
+```
+
+通过一个匿名类来 use Trait，使得在任何地方都可以调用 `source_name()` 来获取当前请求的来源标识。
+
+### 14.4 对导入数据来源缓存的影响
+
+**Sources Trait 本身没有任何缓存逻辑。** 它只是根据当前运行环境（CLI/Queue/API/UI）计算一个字符串标签。
+
+所谓"数据来源缓存"体现在**通过 `created_from` 字段将来源信息写入每一行导入的数据中**，这是一种**持久化缓存**：
+- 导入时打标签：`$row['created_from'] = 'core::import'`
+- 后续查询时可以通过 `where('created_from', 'like', '%import')` 筛选所有导入的数据
+- 审计时可以追溯每条记录的创建渠道
+
+### 14.5 对事务边界的影响
+
+**Sources Trait 对事务边界没有任何直接影响。** 原因：
+
+1. **纯计算逻辑**：所有方法都是纯函数，不读写数据库，不开启或提交事务
+2. **赋值时机早于事务**：`map()` 中设置 `created_from` 是在 PHP 数组层面的赋值，发生在 `ModelManager::flush()` 之前，也就是事务开始之前
+3. **不涉及锁或并发**：不操作共享资源，没有竞态条件需要事务保护
+
+**间接影响：** 由于 `created_from` 被设置为 `$fillable` 字段（通过 `isSourcable()` 检查确认），它会被包含在 `Model::create()` 的批量赋值中，和其他字段在**同一个 INSERT 语句**中写入，因此和整行数据享有相同的事务保护。
+
+### 14.6 Sources Trait 在 Job 类中的使用
+
+Sources Trait 不仅被 Import 类使用，还被很多 Job 类 use，如 [CreateInvitation.php](file:///d:/fz/0601-1/solo-dogfeeding/code/26-akaunting/app/Jobs/Auth/CreateInvitation.php#L15)：
+
+```php
+class CreateInvitation extends Job
+{
+    use Sources;  // ← 在 Job 中使用
+```
+
+这进一步说明 Sources Trait 的定位是**通用的环境识别工具**，而非 Import 专属。它可以在任何需要标记数据来源的地方使用。
+
+### 14.7 设计评价
+
+**优点：**
+- **关注点分离**：数据来源识别逻辑独立封装，不与业务逻辑耦合
+- **代码复用**：Import 类、Job 类、辅助函数都可以复用同一套来源判断逻辑
+- **审计友好**：每条数据都有清晰的来源标识，便于排查问题
+
+**缺点：**
+- **导入场景硬编码**：`map()` 中直接写死了 `'import'` 后缀，无法区分是 UI 导入还是 API 导入（两者都标记为 `core::import`），丢失了调用渠道信息
+- **与 Import 抽象类紧耦合**：`use Sources` 放在抽象类中，意味着所有 Import 类都必须有 `created_from` 字段，否则 `isSourcable()` 会返回 false，但代码仍然会尝试设置该字段（虽然在 `getFillable()` 检查中会被拦截）
+
+**潜在优化点：**
+```php
+// 当前：硬编码
+$row['created_from'] = $this->getSourcePrefix() . 'import';
+
+// 优化：使用 getSourceName() 自动识别调用渠道
+$row['created_from'] = $this->getSourceName();
+```
+
+---
+
+## 十五、修正与补充后的事务边界全景图
+
+结合本章的源码级分析，修正并细化之前的事务边界图：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ 队列 Job: ReadChunk (chunk_size=100)                                │
+│                                                                     │
+│  $transaction(function () {  ← 👈 Maatwebsite 包裹的 chunk 级事务   │
+│                                                                     │
+│    ModelImporter::import():                                         │
+│      ┌─────────────────────────────────────────────────────────┐   │
+│      │ 逐行读取 Excel:                                          │   │
+│      │   Row 1: map() → prepareForValidation() → add(1, $row)  │   │
+│      │   Row 2: map() → prepareForValidation() → add(2, $row)  │   │
+│      │   ...                                                    │   │
+│      │   Row N: map() → prepareForValidation() → add(N, $row)  │   │
+│      └─────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│      ┌─────────────────────────────────────────────────────────┐   │
+│      │ ModelManager::flush($import, $massInsert):              │   │
+│      │                                                          │   │
+│      │  1. validateRows($import):                               │   │
+│      │     → RowValidator::validate($this->rows, $import)       │   │
+│      │     → 有失败？                                           │   │
+│      │        ├─ ✅ 无失败 → 继续                                │   │
+│      │        ├─ ❌ 有失败 & 实现 SkipsOnFailure                │   │
+│      │        │     → unset($this->rows[$failed_row])           │   │
+│      │        │     → 剩余行继续插入                             │   │
+│      │        └─ ❌ 有失败 & 未实现 SkipsOnFailure (本项目)       │   │
+│      │              → ValidationException                       │   │
+│      │              → 事务回滚 → 整个 chunk 撤销                │   │
+│      │                                                          │   │
+│      │  2. massFlush() / singleFlush():                         │   │
+│      │     → 批量 INSERT                                        │   │
+│      │     → 单条 saveOrFail()                                  │   │
+│      │     → 其中 created_from 由 Sources Trait 提供            │   │
+│      └─────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│    AfterChunk 事件 → success                                       │
+│  });  ← 事务提交                                                   │
+│                                                                     │
+│  [Trait 自动创建关联对象: 独立的 DB::transaction]                   │
+│    → dispatch(new CreateCategory($data))                            │
+│    → 独立事务，独立回滚                                             │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 15.1 最终事务边界总结（修正版）
+
+| 层级 | 事务策略 | 实现位置 | 回滚范围 |
+|------|----------|----------|----------|
+| **整体导入** | ❌ 无全局事务 | - | 跨 chunk 的数据不一致不会自动回滚 |
+| **单 chunk** | ✅ `DB::transaction` 包裹 | `DbTransactionHandler::__invoke()` | 当前 chunk 的所有行 |
+| **chunk 内验证失败** | ❌ 本项目未实现 `SkipsOnFailure` | `RowValidator::validate()` → `ValidationException` | 整个 chunk 回滚 |
+| **Trait 自动创建关联** | ✅ 独立 `DB::transaction` | 各 CreateXxx Job 内部 | 仅该关联对象 |
+| **主表 `new Model($row)`** | ✅ 受 chunk 事务保护 | `ModelManager::massFlush()` 或 `singleFlush()` | 和 chunk 同生共死 |
+| **Sources Trait** | ⚪ 无直接影响 | `map()` 中 PHP 数组赋值 | 但 `created_from` 随整行一起在事务内插入 |

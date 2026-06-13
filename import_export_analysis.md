@@ -1656,7 +1656,7 @@ public function handle(TransactionHandler $transaction)
 - **db handler**：每个 chunk 在**一个独立事务**中
 - **null handler**：直接执行，无事务包裹
 
-> **重要区别**：同步模式是「整个导入一个事务」，队列模式是「每个 chunk 一个事务」。akaunting 因为配置了 `ShouldQueue`，所以实走的是 chunk 级事务。
+> **之前的错误结论修正**：之前认为"同步模式是整个导入一个事务"是错误的。因为只要实现了 `WithChunkReading`，`Reader::read()` 会在事务包裹代码之前**早返回**给 `ChunkReader`，所以同步模式和异步模式**都是 chunk 级事务**。详见第十九章的源码级证明。
 
 ### 17.3 null handler + batchSize=1 时验证失败的行为
 

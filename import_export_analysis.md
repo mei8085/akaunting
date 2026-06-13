@@ -1469,13 +1469,383 @@ $row['created_from'] = $this->getSourceName();
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 15.1 最终事务边界总结（修正版）
+### 15.1 最终事务边界总结（按 handler 分档修正版）
 
-| 层级 | 事务策略 | 实现位置 | 回滚范围 |
-|------|----------|----------|----------|
-| **整体导入** | ❌ 无全局事务 | - | 跨 chunk 的数据不一致不会自动回滚 |
-| **单 chunk** | ✅ `DB::transaction` 包裹 | `DbTransactionHandler::__invoke()` | 当前 chunk 的所有行 |
-| **chunk 内验证失败** | ❌ 本项目未实现 `SkipsOnFailure` | `RowValidator::validate()` → `ValidationException` | 整个 chunk 回滚 |
-| **Trait 自动创建关联** | ✅ 独立 `DB::transaction` | 各 CreateXxx Job 内部 | 仅该关联对象 |
-| **主表 `new Model($row)`** | ✅ 受 chunk 事务保护 | `ModelManager::massFlush()` 或 `singleFlush()` | 和 chunk 同生共死 |
-| **Sources Trait** | ⚪ 无直接影响 | `map()` 中 PHP 数组赋值 | 但 `created_from` 随整行一起在事务内插入 |
+| 层级 | db handler（本项目默认） | null handler | 实现位置 |
+|------|-------------------------|--------------|----------|
+| **整体导入** | ❌ 无全局事务 | ❌ 无全局事务 | - |
+| **单 chunk** | ✅ `DB::transaction` 包裹 | ❌ 纯执行，无事务包裹 | `TransactionHandler::__invoke()` |
+| **chunk 内验证失败（未实现 SkipsOnFailure）** | ✅ 异常 → 事务回滚 → 整 chunk 撤销 | ✅ 异常 → 但无事务可回滚 → 已插入的行不会撤销 | `RowValidator::validate()` → `ValidationException` |
+| **chunk 内验证失败（实现 SkipsOnFailure）** | ✅ unset 失败行 → 其余行事务内插入 | ❌ unset 失败行 → 其余行逐行插入，无事务保护 | `ModelManager::validateRows()` → `RowSkippedException` |
+| **Trait 自动创建关联** | ✅ 独立 `DB::transaction`（嵌套事务） | ✅ 独立 `DB::transaction` | 各 CreateXxx Job 内部 |
+| **主表 `new Model($row)`** | ✅ 受 chunk 事务保护 | ❌ 裸插入，失败即中断，之前的行已入库 | `ModelManager::massFlush()` 或 `singleFlush()` |
+| **Sources Trait** | ⚪ 无直接影响（`created_from` 随整行在事务内） | ⚪ 无直接影响（`created_from` 随整行裸插） | `map()` 中 PHP 数组赋值 |
+
+> **本项目实际情况**：[config/excel.php](file:///d:/fz/0601-1/solo-dogfeeding/code/26-akaunting/config/excel.php#L302-L304) 中 `'handler' => env('EXCEL_TRANSACTIONS_HANDLER', 'db')`，默认走 **db handler**，即每个 chunk 有 `DB::transaction` 包裹。
+
+---
+
+## 十六、batchSize=1 时逐行 flush+validateRows+insert 的真实路径
+
+### 16.1 batchSize 的来源
+
+[ModelImporter::import()](https://github.com/SpartnerNL/Laravel-Excel/blob/3.1/src/Imports/ModelImporter.php#L38-L40) 中的定义：
+
+```php
+$batchSize = $import instanceof WithBatchInserts ? $import->batchSize() : 1;
+```
+
+akaunting 的 [Abstracts/Import.php](file:///d:/fz/0601-1/solo-dogfeeding/code/26-akaunting/app/Abstracts/Import.php) 类签名中**没有** `implements WithBatchInserts`，所以 `batchSize = 1`。
+
+### 16.2 逐行 flush 的完整调用链路
+
+```
+ReadChunk::handle()
+  ↓
+$transaction(function () {
+    $sheet->import($sheetImport, $startRow);
+})
+  ↓
+Sheet::import()
+  ↓
+ModelImporter::import(Worksheet, ToModel, startRow)
+  ↓
+// 逐行循环
+foreach ($worksheet->getRowIterator($startRow, $endRow) as $spreadSheetRow) {
+    $i++;
+    $rowArray = ... // SkipsEmptyRows、prepareForValidation、map() 处理
+    $this->manager->add($row->getIndex(), $rowArray);  // add 到内存数组
+    
+    // ✅ batchSize=1 时：每加一行就 flush 一次
+    if (($i % $batchSize) === 0) {  // 1 % 1 === 0 → 永远成立
+        $this->flush($import, $batchSize, $batchStartRow);
+        $batchStartRow += $i;
+        $i = 0;
+    }
+}
+if ($i > 0) { $this->flush(...); }  // 处理剩余（batchSize=1 时永远为空）
+  ↓
+ModelManager::flush($import, $massInsert = false)  // batchSize=1 → massInsert=false
+  ↓
+// 第一步：验证
+if ($import instanceof WithValidation) {
+    $this->validateRows($import);  // ← 每次 flush 只验证 1 行
+}
+  ↓
+// 第二步：插入（单条模式）
+$this->singleFlush($import);
+```
+
+### 16.3 singleFlush 的内部实现
+
+[ModelManager::singleFlush()](https://github.com/SpartnerNL/Laravel-Excel/blob/3.1/src/Imports/ModelManager.php#L141-L166)：
+
+```php
+private function singleFlush(ToModel $import)
+{
+    $this->rows()
+        ->each(function (array $attributes, $index) use ($import) {
+            $this->toModels($import, $attributes, $index)->each(function (Model $model) use ($import) {
+                try {
+                    if ($import instanceof WithUpserts) {
+                        $model->upsert(...);
+                        return;
+                    } elseif ($import instanceof WithSkipDuplicates) {
+                        $model::query()->insertOrIgnore([$model->getAttributes()]);
+                        return;
+                    }
+                    if ($import instanceof PersistRelations) {
+                        $this->cascade->persist($model);
+                    } else {
+                        $model->saveOrFail();  // ← 单条 save
+                    }
+                } catch (Throwable $e) {
+                    $this->handleException($import, $e);
+                }
+            });
+        });
+}
+```
+
+### 16.4 性能代价：每行一次 validate + 每行一次 save
+
+当 `batchSize=1` 时：
+- **验证次数**：每行调用一次 `RowValidator::validate()`，而 `RowValidator` 内部是 `Validator::make($rows, $rules)->validate()` —— 虽然只验证 1 行，但 Laravel Validator 的初始化开销是固定的
+- **插入次数**：每行调用一次 `$model->saveOrFail()`，即每行一次 INSERT 语句
+- **事务边界**：整个 chunk 在一个 `DB::transaction` 中，虽然是逐行插入，但都在同一个事务里
+
+对比 `WithBatchInserts` + `batchSize=100`：
+- 验证 1 次（100 行一起验证）
+- 插入 1 次（100 行一起 `INSERT INTO ... VALUES (...), (...)`）
+
+**akaunting 选择 batchSize=1 的原因**：
+- 项目中 Import 类的 `model()` 方法可能返回 `null`（去重时 `return;`），批量插入无法处理返回 null 的情况
+- `WithBatchInserts` 要求 `model()` 返回的每个 Model 的属性完全一致，否则批量插入会出问题
+- 逐行插入更灵活，配合 `SkipsEmptyRows` 等机制容错性更好
+
+### 16.5 batchSize 与 chunkSize 的区别
+
+| 概念 | 所属接口 | 作用 | akaunting 值 |
+|------|----------|------|-------------|
+| **chunkSize** | `WithChunkReading` | 一个队列 Job 处理多少行 Excel，决定并发度和内存 | 100 |
+| **batchSize** | `WithBatchInserts` | 一次数据库 INSERT 插入多少行，决定数据库压力 | 1（未实现） |
+
+---
+
+## 十七、事务 handler 的 db/null 两档深度对比
+
+### 17.1 配置与服务绑定
+
+[config/excel.php:302-304](file:///d:/fz/0601-1/solo-dogfeeding/code/26-akaunting/config/excel.php#L302-L304)：
+
+```php
+'transactions' => [
+    'handler' => env('EXCEL_TRANSACTIONS_HANDLER', 'db'),
+],
+```
+
+支持的两个 handler：
+
+| handler | 实现类 | 行为 |
+|---------|--------|------|
+| `db` | `Maatwebsite\Excel\Transactions\DbTransactionHandler` | `$connection->transaction($callback)` —— 数据库事务包裹 |
+| `null` | `Maatwebsite\Excel\Transactions\NullTransactionHandler` | 直接 `return $callback()` —— 不做任何事务处理 |
+
+### 17.2 事务 handler 在两个地方生效
+
+**位置一：同步模式 —— Reader::read()**
+
+[Reader::read()](https://github.com/SpartnerNL/Laravel-Excel/blob/3.1/src/Reader.php#L60-L84)：
+
+```php
+try {
+    $this->loadSpreadsheet($import);
+    ($this->transaction)(function () use ($import) {  // ← 全局事务包裹
+        foreach ($this->sheetImports as $index => $sheetImport) {
+            if ($sheet = $this->getSheet($import, $sheetImport, $index)) {
+                $sheet->import($sheetImport, ...);
+            }
+        }
+    });
+    $this->afterImport($import);
+} catch (Throwable $e) {
+    // ...
+}
+```
+
+- **db handler**：整个导入过程（所有 Sheet、所有行）在**一个大事务**中
+- **null handler**：直接执行，无事务包裹
+
+**位置二：队列模式 —— ReadChunk::handle()**
+
+[ReadChunk::handle()](https://raw.githubusercontent.com/SpartnerNL/Laravel-Excel/3.1/src/Jobs/ReadChunk.php)：
+
+```php
+public function handle(TransactionHandler $transaction)
+{
+    // ... 准备工作
+    
+    $transaction(function () use ($sheet) {  // ← 每个 chunk 独立事务
+        $sheet->import($this->sheetImport, $this->startRow);
+        // ...
+        $sheet->raise(new AfterChunk(...));
+    });
+}
+```
+
+- **db handler**：每个 chunk 在**一个独立事务**中
+- **null handler**：直接执行，无事务包裹
+
+> **重要区别**：同步模式是「整个导入一个事务」，队列模式是「每个 chunk 一个事务」。akaunting 因为配置了 `ShouldQueue`，所以实走的是 chunk 级事务。
+
+### 17.3 null handler + batchSize=1 时验证失败的行为
+
+这是一个很重要的边界情况：**当 handler=null 且 batchSize=1 时，chunk 内验证失败还能保证"整 chunk 跳过"吗？**
+
+**答案：能，但原因不同。**
+
+```
+null handler + batchSize=1 + 未实现 SkipsOnFailure 的场景：
+
+Row 1: add → flush → validateRows(1行) ✅ → singleFlush → saveOrFail() ✅
+Row 2: add → flush → validateRows(1行) ❌ → ValidationException → 中断
+Row 3: (不会执行)
+```
+
+让我们沿着代码看清楚：
+
+1. `batchSize=1` 意味着每一行都先调用 `validateRows()`，再调用 `singleFlush()`
+2. 当第 N 行验证失败时，`RowValidator::validate()` 抛 `ValidationException`
+3. 这个异常冒泡出 `flush()`，再冒泡出 `ModelImporter::import()` 的 foreach 循环
+4. 由于 **null handler 没有事务包裹**，所以没有回滚
+5. 但前面 N-1 行已经通过 `saveOrFail()` 写入数据库了
+
+**结论修正**：
+- **db handler 时**：验证失败 → 事务回滚 → **整个 chunk 全部撤销**（包括前面已经成功的行）
+- **null handler 时**：验证失败 → 无事务可回滚 → **失败行之前的行已经入库，只有失败行及之后的行被跳过**
+
+这和之前"整 chunk 跳过"的断言在 null handler 下**不成立**。只有 db handler 才保证整 chunk 原子性。
+
+### 17.4 选择建议
+
+| 场景 | 推荐 handler | 原因 |
+|------|-------------|------|
+| 数据一致性要求高 | `db` | 每个 chunk 原子性，失败不残留 |
+| 大批量导入、性能优先 | `null` | 减少事务开销，失败了部分成功也可接受 |
+| 配合 `SkipsOnFailure` | `null` 也安全 | 失败行被跳过，成功行入库，无所谓事务 |
+| 配合 `WithBatchInserts` | `db` | 批量插入 + 事务回滚 = 最佳性能一致性比 |
+
+---
+
+## 十八、ChunkReader 分发器的三种 dispatch 分支
+
+### 18.1 两个类的分工
+
+- **ChunkReader**（分发器）：负责切分 chunk、生成 ReadChunk Job 列表、决定分发策略
+- **ReadChunk**（单 chunk Job）：负责实际读取一个 chunk 的 Excel 数据并导入
+
+### 18.2 ChunkReader::read() 中的三个分支
+
+[ChunkReader.php](https://github.com/SpartnerNL/Laravel-Excel/blob/3.1/src/ChunkReader.php) 的 `read()` 方法末尾有三段 if 分支：
+
+```php
+// 第一步：生成所有 ReadChunk Job
+$jobs = new Collection();
+foreach ($worksheets as $name => $sheetImport) {
+    for ($currentRow = $startRow; $currentRow <= $totalRows[$name]; $currentRow += $chunkSize) {
+        $jobs->push(new ReadChunk(
+            $import, $reader->getPhpSpreadsheetReader(),
+            $temporaryFile, $name, $sheetImport,
+            $currentRow, $chunkSize
+        ));
+    }
+}
+$afterImportJob = new AfterImportJob($import, $reader);
+
+// 第二步：三种分发策略
+if ($import instanceof ShouldQueueWithoutChain) {
+    // 分支一：无链式的队列分发
+    ...
+}
+
+$jobs->push($afterImportJob);
+
+if ($import instanceof ShouldQueue) {
+    // 分支二：带链式的队列分发
+    ...
+}
+
+// 分支三：同步分发（都不满足时走这里）
+$jobs->each(function ($job) {
+    function_exists('dispatch_now')
+        ? dispatch_now($job)
+        : $this->dispatchNow($job);
+});
+```
+
+### 18.3 分支一：ShouldQueueWithoutChain —— 并行独立分发
+
+```php
+if ($import instanceof ShouldQueueWithoutChain) {
+    $afterImportJob->setInterval($delayCleanup);
+    $afterImportJob->setDependencies($jobs);
+    $jobs->push($afterImportJob->delay($delayCleanup));
+    
+    return $jobs->each(function ($job) use ($queue) {
+        dispatch($job->onQueue($queue));  // ← 每个 Job 独立 dispatch
+    });
+}
+```
+
+**特点：**
+- 每个 `ReadChunk` Job 直接 `dispatch()`，**并行执行**，不等待前一个完成
+- `AfterImportJob` 通过 `setDependencies($jobs)` 声明依赖，等所有 chunk 完成后才执行
+- 没有 `QueueImport` 包装，没有 chain 机制
+- 适合 chunk 之间无依赖、追求最大并发的场景
+
+### 18.4 分支二：ShouldQueue —— 链式分发
+
+```php
+if ($import instanceof ShouldQueue) {
+    return new PendingDispatch(
+        (new QueueImport($import))->chain($jobs->toArray())  // ← 所有 Job 串成一条链
+    );
+}
+```
+
+**特点：**
+- 使用 Laravel 的 Job chaining 机制：`QueueImport` 作为主 Job，所有 `ReadChunk` + `AfterImportJob` 作为链式 Job
+- **串行执行**：一个 chunk 处理完才处理下一个
+- 通过 `PendingDispatch` 返回，调用方可以继续链式配置
+- 适合 chunk 之间有依赖、或数据库连接数有限的场景
+
+> **注意**：`ShouldQueueWithoutChain` 的判断在 `ShouldQueue` 之前，且两个 if 不是互斥的。但 `ShouldQueueWithoutChain extends ShouldQueue`，所以同时满足时先走第一个分支，且第一个分支有 `return`，第二个分支不会执行。
+
+### 18.5 分支三：同步 dispatch_now
+
+```php
+$jobs->each(function ($job) {
+    try {
+        function_exists('dispatch_now')
+            ? dispatch_now($job)
+            : $this->dispatchNow($job);
+    } catch (Throwable $e) {
+        if (method_exists($job, 'failed')) {
+            $job->failed($e);
+        }
+        throw $e;
+    }
+});
+```
+
+**特点：**
+- 不进队列，当前进程同步执行每个 Job
+- `dispatch_now` 或自定义 `dispatchNow()` 方法
+- 异常会被捕获并调用 `$job->failed()`，然后重新抛出
+- 适合小文件、测试、CLI 命令等场景
+
+### 18.6 akaunting 实际走哪条？
+
+akaunting 的 [Abstracts/Import.php](file:///d:/fz/0601-1/solo-dogfeeding/code/26-akaunting/app/Abstracts/Import.php) 和 [Abstracts/ImportMultipleSheets.php](file:///d:/fz/0601-1/solo-dogfeeding/code/26-akaunting/app/Abstracts/ImportMultipleSheets.php)：
+
+```php
+abstract class Import implements 
+    HasLocalePreference,
+    ShouldQueue,  // ← 实现了 ShouldQueue
+    SkipsEmptyRows,
+    WithChunkReading,
+    ...
+```
+
+```php
+abstract class ImportMultipleSheets implements 
+    ShouldQueue,  // ← 也实现了 ShouldQueue
+    WithChunkReading,
+    ...
+```
+
+都**实现了 `ShouldQueue` 但没有实现 `ShouldQueueWithoutChain`**。
+
+**结合 `should_queue()` 配置的完整判断：**
+
+| 场景 | 配置 `should_queue()` | 实际走的分支 |
+|------|----------------------|-------------|
+| 生产环境队列开启 | `true` | **分支二：ShouldQueue 链式分发** |
+| 开发环境队列关闭 | `false` | **分支三：同步 dispatch_now** |
+
+akaunting 在 [Utilities/Import.php](file:///d:/fz/0601-1/solo-dogfeeding/code/26-akaunting/app/Utilities/Import.php) 中通过 `should_queue()` 判断后分别调用：
+- 同步：`$class->import($file)` → Reader::read → WithChunkReading → ChunkReader → **分支三 dispatch_now**
+- 异步：`$class->queue($file)` → Excel::queueImport → Reader::read → WithChunkReading → ChunkReader → **分支二 ShouldQueue 链式**
+
+但实际因为 Import 类本身 `implements ShouldQueue`，所以即使走 `import()` 方法，Reader 内部检测到 `WithChunkReading + ShouldQueue` 也会返回 `PendingDispatch`（进队列），这也是为什么 Utilities 层要自己判断 `should_queue()` 再决定调用哪个方法。
+
+### 18.7 三种分支对比总结
+
+| 维度 | ShouldQueueWithoutChain | ShouldQueue（链式） | 同步 dispatch_now |
+|------|-------------------------|---------------------|-------------------|
+| **执行方式** | 并行队列 | 串行队列（chain） | 同步当前进程 |
+| **并发度** | 高（所有 chunk 同时） | 低（逐个执行） | 无（串行） |
+| **事务范围** | 每个 chunk 独立事务 | 每个 chunk 独立事务 | 整个导入一个事务（Reader 层） |
+| **失败影响** | 单个 chunk 失败不影响其他 | 一个失败 → chain 中断 → 后续 chunk 不执行 | 第一个失败就全部中断回滚 |
+| **akaunting 使用** | ❌ 未使用 | ✅ 异步模式使用 | ✅ 同步模式使用 |
+| **适用场景** | 大文件、无依赖、追求速度 | 资源有限、chunk 间有依赖 | 小文件、测试、开发环境 |

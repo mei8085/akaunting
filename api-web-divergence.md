@@ -144,7 +144,7 @@ public function index()
 
 **代码路径**：
 ```
-Controller action → ajaxDispatch(job) → 手动添加 redirect/message → response()->json($response)
+Controller action → ajaxDispatch(job) → 手动追加 redirect/message → response()->json($response)
 ```
 
 **关键代码**（`app/Traits/Jobs.php` 第 55-77 行）：
@@ -152,12 +152,12 @@ Controller action → ajaxDispatch(job) → 手动添加 redirect/message → re
 public function ajaxDispatch($job)
 {
     try {
-        $data = $this->dispatch($job);  // job 返回值，通常是 Model 对象
+        $data = $this->dispatch($job);  // job handle() 的返回值
 
         $response = [
             'success' => true,
             'error' => false,
-            'data' => $data,  // Model 对象，序列化时自动 toArray()
+            'data' => $data,  // 直接取 job 返回值，不做任何转换
             'message' => '',
         ];
     } catch (Exception | Throwable $e) {
@@ -173,23 +173,39 @@ public function ajaxDispatch($job)
 }
 ```
 
-**数据来源规则**：
-- `data` 字段 = Job 的返回值（通常是创建/更新后的 Model 对象）
-- **注意**：Controller 不会删除 `data` 字段，只会追加 `redirect`、`message` 等字段
-- 序列化规则与通用包装相同：数据库字段（经字段访问器转换） + `$appends` 中的虚拟访问器 - `$hidden`
+**核心机制**：`ajaxDispatch` 将 Job 的 `handle()` 返回值原样放入 `$response['data']`。`data` 的实际类型**完全取决于 Job 的 `handle()` 返回值类型**，不同操作返回截然不同的数据。
 
-**响应结构**（成功时）：
-```json
+#### 3.2.1 Job handle() 返回值类型一览
+
+所有 Job 都继承 `app/Abstracts/Job.php`，按接口分为三类：
+
+| Job 接口 | 代表操作 | handle() 返回类型 | data 实际值 | Model 序列化？ |
+|----------|----------|-------------------|-------------|---------------|
+| `ShouldCreate` | `store`、`import`、`duplicate` | `Model`（如 `Item`、`Currency`） | 创建后的完整 Model 对象 | ✅ 完整 `toArray()` |
+| `ShouldUpdate` | `update`、`enable`、`disable` | `Model`（如 `Item`、`Currency`） | 更新后的完整 Model 对象 | ✅ 完整 `toArray()` |
+| `ShouldDelete` | `destroy` | `bool`（固定 `true`） | 布尔值 `true` | ❌ 不是 Model |
+
+**关键区别**：
+- **Create/Update Job**：`handle()` 返回 `Model` 对象 → `response()->json()` 时自动调用 `toArray()` → **完整的 Model 序列化**
+- **Delete Job**：`handle()` 返回 `bool true` → `response()->json()` 时直接输出 → **`data` 是 `true` 而非 Model 数据**
+
+#### 3.2.2 创建/更新类 Job（data = Model 序列化）
+
+**代码示例**（`app/Jobs/Common/CreateItem.php` 第 16-36 行）：
+```php
+class CreateItem extends Job implements HasOwner, HasSource, ShouldCreate
 {
-  "success": true,
-  "error": false,
-  "data": { /* Model 序列化结果 */ },
-  "message": "操作成功提示",
-  "redirect": "/common/items"
+    public function handle(): Item  // 返回类型是 Model
+    {
+        // ...
+        $this->model = Item::create($this->request->all());
+        // ...
+        return $this->model;  // 返回完整的 Model 对象
+    }
 }
 ```
 
-**典型代码**（`app/Http/Controllers/Common/Items.php` 第 61-79 行）：
+**Controller 使用**（`app/Http/Controllers/Common/Items.php` 第 61-79 行）：
 ```php
 public function store(Request $request)
 {
@@ -197,95 +213,449 @@ public function store(Request $request)
 
     if ($response['success']) {
         $response['redirect'] = route('items.index');
-        $message = trans('messages.success.created', ['type' => trans_choice('general.items', 1)]);
-        flash($message)->success();
-    } else {
-        $response['redirect'] = route('items.create');
-        $message = $response['message'];
-        flash($message)->error()->important();
+        // Controller 不删除 data，只追加 redirect 和 flash
     }
 
-    return response()->json($response);  // data 字段完整保留
+    return response()->json($response);
+    // $response['data'] 是 Item Model → 自动 toArray()
 }
 ```
+
+**响应结构**（成功时）：
+```json
+{
+  "success": true,
+  "error": false,
+  "data": {
+    "id": 1,
+    "name": "...",
+    "...": "完整 Model 序列化（数据库字段 + $appends - $hidden）"
+  },
+  "message": "",
+  "redirect": "/common/items"
+}
+```
+
+**特殊用法**：Controller 可以直接访问 `$response['data']` 的 Model 属性：
+```php
+// app/Http/Controllers/Purchases/Bills.php 第 87 行
+$response['redirect'] = route('bills.show', $response['data']->id);
+```
+这证明 `$response['data']` 在 `ajaxDispatch` 返回后仍是 Model 对象，直到 `response()->json()` 时才序列化。
+
+#### 3.2.3 删除类 Job（data = 布尔值 true）
+
+**代码示例**（`app/Jobs/Common/DeleteItem.php` 第 12-27 行）：
+```php
+class DeleteItem extends Job implements ShouldDelete
+{
+    public function handle(): bool  // 返回类型是 bool
+    {
+        $this->authorize();
+
+        \DB::transaction(function () {
+            $this->deleteRelationships($this->model, ['taxes']);
+            $this->model->delete();  // 已删除，Model 不再有效
+        });
+
+        return true;  // 返回 true 而非 Model
+    }
+}
+```
+
+**Controller 使用**（`app/Http/Controllers/Common/Items.php` 第 209-226 行）：
+```php
+public function destroy(Item $item)
+{
+    $response = $this->ajaxDispatch(new DeleteItem($item));
+
+    $response['redirect'] = route('items.index');
+    // Controller 无法访问 $response['data']->id，因为 data 是 true
+
+    return response()->json($response);
+}
+```
+
+**响应结构**（成功时）：
+```json
+{
+  "success": true,
+  "error": false,
+  "data": true,
+  "message": "",
+  "redirect": "/common/items"
+}
+```
+
+**重要区分**：
+- `data` 是 `true`，不是被删除的 Model 数据
+- 已删除的 Model 不可序列化（数据库记录已不存在）
+- 这与 API 出口的 `destroy`（204 No Content，无响应体）完全不同
+
+#### 3.2.4 弹窗保存动作（data = Model 序列化）
+
+弹窗控制器的 `store`/`update` 同样使用 `ajaxDispatch`，data 来源与普通写操作相同：
+
+**代码示例**（`app/Http/Controllers/Modals/Items.php` 第 52-75 行）：
+```php
+public function store(IRequest $request)
+{
+    $response = $this->ajaxDispatch(new CreateItem($request));
+    // $response['data'] = Item Model → toArray()
+
+    if ($response['success']) {
+        $response['message'] = trans('messages.success.created', ...);
+    }
+
+    return response()->json($response);
+    // data 包含完整的 Item Model 序列化
+}
+```
+
+**弹窗付款保存**（`app/Http/Controllers/Modals/DocumentTransactions.php` 第 128-143 行）：
+```php
+public function store(Document $document, Request $request)
+{
+    $response = $this->ajaxDispatch(new CreateBankingDocumentTransaction($document, $request));
+    // CreateBankingDocumentTransaction::handle() 返回 Transaction Model
+    // $response['data'] = Transaction Model → toArray()
+
+    if ($response['success']) {
+        $response['redirect'] = $this->getRedirectUrl($document, $request);
+    }
+
+    return response()->json($response);
+}
+```
+
+**弹窗付款删除**（`app/Http/Controllers/Modals/DocumentTransactions.php` 第 263-286 行）：
+```php
+public function destroy(Document $document, Transaction $transaction)
+{
+    $response = $this->ajaxDispatch(new DeleteTransaction($transaction));
+    // DeleteTransaction::handle() 返回 bool true
+    // $response['data'] = true
+
+    $response['redirect'] = route(...);
+
+    return response()->json($response);
+}
+```
+
+#### 3.2.5 直接返回模式 data 类型汇总
+
+| 操作类型 | Job 返回类型 | data 字段值 | 序列化方式 |
+|----------|-------------|------------|-----------|
+| 创建 `store` | `Model` | 创建后的 Model 对象 | `Model->toArray()`（含 $appends - $hidden） |
+| 更新 `update` | `Model` | 更新后的 Model 对象 | `Model->toArray()`（含 $appends - $hidden） |
+| 启用 `enable` | `Model` | 更新后的 Model 对象 | `Model->toArray()`（含 $appends - $hidden） |
+| 禁用 `disable` | `Model` | 更新后的 Model 对象 | `Model->toArray()`（含 $appends - $hidden） |
+| 删除 `destroy` | `bool` | `true` | 直接输出布尔值 |
+| 导入 `import` | `Model` | 最后一条创建的 Model | `Model->toArray()`（含 $appends - $hidden） |
+| 重复 `duplicate` | `Model` | 克隆后的 Model | `Model->toArray()`（含 $appends - $hidden） |
+
+**注意**：`enable`/`disable` 本质上是 `UpdateJob`，传入 `['enabled' => 1]` 或 `['enabled' => 0]`，所以返回的是更新后的 Model。
 
 ---
 
 ### 3.3 第三类：特殊接口直接返回
 
-**典型场景**：Modal 弹窗接口、autocomplete 自动补全、config 配置查询等
+**典型场景**：Modal 弹窗展示、autocomplete 自动补全、config 配置查询、特殊操作等
 
 **代码路径**：
 - 直接调用 `response()->json(...)`，手动构造响应
 - 不经过 `$this->response()`，也不使用 `ajaxDispatch()`
 
-**子模式 A：Modal 弹窗接口**（返回 HTML 字符串）
-- **代码位置**：`app/Http/Controllers/Modals/` 目录下所有控制器
-- **数据内容**：`html` 字段为 Blade 渲染后的 HTML 字符串，无数据实体
-- **响应结构**：
-  ```json
-  {
-    "success": true,
-    "error": false,
-    "message": "null",
-    "html": "<div>...</div>"
-  }
-  ```
-- **典型代码**（`app/Http/Controllers/Modals/Items.php` 第 30-43 行）：
-  ```php
-  public function create(IRequest $request)
-  {
-      $taxes = Tax::enabled()->orderBy('name')->get()->pluck('title', 'id');
-      $currency = Currency::where('code', default_currency())->first();
-      $html = view('modals.items.create', compact('taxes', 'currency'))->render();
-      return response()->json([
-          'success' => true,
-          'error' => false,
-          'message' => 'null',
-          'html' => $html,
-      ]);
-  }
-  ```
+#### 3.3.1 子模式 A：Modal 弹窗展示（data = 手动数组）
 
-**子模式 B：autocomplete 自动补全接口**（手动构造数据）
-- **代码位置**：如 `app/Http/Controllers/Common/Items.php` 的 `autocomplete()` 方法
-- **数据内容**：手动遍历 Model 并添加计算字段（如 `total`）
-- **响应结构**：
-  ```json
-  {
-    "success": true,
-    "message": "Get all items.",
-    "errors": [],
-    "data": [ /* 手动构造的数据 */ ]
-  }
-  ```
-- **典型代码**（`app/Http/Controllers/Common/Items.php` 第 238-319 行）：
-  ```php
-  public function autocomplete()
-  {
-      // ... 手动计算 total 并设置到 $item->total
-      return response()->json([
-          'success' => true,
-          'message' => 'Get all items.',
-          'errors' => [],
-          'data' => $items,  // 已手动修改的 Model 集合
-      ]);
-  }
-  ```
+**代码位置**：`app/Http/Controllers/Modals/` 目录下各控制器的 `create`/`edit` 方法
 
-**子模式 C：config 等简单对象接口**
-- **代码位置**：如 `app/Http/Controllers/Settings/Currencies.php` 的 `config()` 方法
-- **数据内容**：简单对象或数组，无固定结构
+**特征**：
+- 返回 `html` 字段（Blade 渲染后的 HTML 字符串）
+- `data` 字段是手动构造的关联数组，非 Model 序列化
+- 可能包含 `title`、`buttons` 等控制信息
+
+**代码示例**（`app/Http/Controllers/Modals/DocumentTransactions.php` 第 108-118 行）：
+```php
+return response()->json([
+    'success' => true,
+    'error' => false,
+    'message' => 'null',
+    'html' => $html,
+    'data' => [
+        'title' => trans('general.title.new', ['type' => trans_choice('general.payments', 1)]),
+        'buttons' => $buttons,
+    ]
+]);
+```
+
+**响应结构**：
+```json
+{
+  "success": true,
+  "error": false,
+  "message": "null",
+  "html": "<div>...</div>",
+  "data": {
+    "title": "New Payment",
+    "buttons": { "cancel": {...}, "confirm": {...} }
+  }
+}
+```
+
+**注意**：`data` 不是 Model 序列化，是手动构造的 UI 控制数据。
+
+#### 3.3.2 子模式 B：简单 Modal（data 不存在）
+
+部分 Modal 只返回 `html`，甚至没有 `data` 字段。
+
+**代码示例**（`app/Http/Controllers/Modals/Items.php` 第 38-43 行）：
+```php
+return response()->json([
+    'success' => true,
+    'error' => false,
+    'message' => 'null',
+    'html' => $html,
+]);
+```
+
+**响应结构**：
+```json
+{
+  "success": true,
+  "error": false,
+  "message": "null",
+  "html": "<div>...</div>"
+}
+```
+
+#### 3.3.3 子模式 C：autocomplete 自动补全（data = 修改后的 Model 集合）
+
+**代码位置**：如 `app/Http/Controllers/Common/Items.php` 第 238-323 行
+
+**特征**：
+- 查询 Model 集合后手动修改属性（如 `$item->total = $total`）
+- 修改后的虚拟属性不需要 `$appends` 也能序列化（因为是直接赋值到 Model 动态属性）
+- 序列化时包含数据库字段 + `$appends` + 手动添加的动态属性
+
+**代码示例**：
+```php
+public function autocomplete()
+{
+    $items = Item::with('taxes')->autocomplete([...])->with(['taxes.tax'])->get();
+
+    foreach ($items as $item) {
+        // ... 计算逻辑
+        $item->total = $total;  // 动态赋值，非访问器
+    }
+
+    return response()->json([
+        'success' => true,
+        'message' => 'Get all items.',
+        'errors' => [],
+        'count' => $items->count(),
+        'data' => ($items->count()) ? $items : null,
+    ]);
+}
+```
+
+**响应结构**：
+```json
+{
+  "success": true,
+  "message": "Get all items.",
+  "errors": [],
+  "count": 5,
+  "data": [
+    {
+      "id": 1,
+      "...": "数据库字段 + $appends + 动态添加的 total",
+      "total": 120.5
+    }
+  ]
+}
+```
+
+**注意**：`$item->total = $total` 是直接给 Model 实例赋值，序列化时会自动包含，但这是**运行时动态属性**，不是访问器也不是 `$appends`。
+
+#### 3.3.4 子模式 D：config 等简单对象接口（无 data 包装）
+
+**代码位置**：如 `app/Http/Controllers/Settings/Currencies.php` 第 229-247 行
+
+**特征**：
+- 返回简单 `stdClass` 对象或关联数组
+- 无 `{success, error, data, message}` 包装
+- 字段来自外部库（货币库）而非 Model
+
+**代码示例**：
+```php
+public function config()
+{
+    $json = new \stdClass();
+
+    $code = request('code');
+
+    if ($code) {
+        $currency = (object) currency($code)->toArray()[$code];
+        $currency->rate = isset($currencies[$code]) ? $currencies[$code] : null;
+        $currency->symbol_first = ! empty($currency->symbol_first) ? 1 : 0;
+        $json = $currency;
+    }
+
+    return response()->json($json);
+}
+```
+
+**响应结构**：
+```json
+{
+  "name": "US Dollar",
+  "code": "USD",
+  "rate": 1,
+  "symbol": "$",
+  "symbol_first": 1,
+  "decimal_mark": ".",
+  "thousands_separator": ","
+}
+```
+
+**注意**：这不是 Currency Model 序列化，是货币库 `currency()` 函数返回的原始数据加上 `rate` 修正。字段名和值都与 Model 序列化不同。
+
+#### 3.3.5 子模式 E：手动构造响应（data = null）
+
+**代码位置**：如 `app/Http/Controllers/Portal/Profile.php` 第 74-82 行
+
+**特征**：
+- 不使用 `ajaxDispatch`，直接在 Controller 中操作 Model
+- 显式设置 `data` 为 `null`
+
+**代码示例**：
+```php
+public function update(Request $request)
+{
+    $user->update($request->input());
+    $user->contact->update($request->only([...]));
+    // 直接操作 Model，不通过 Job
+
+    $response = [
+        'success' => true,
+        'error' => false,
+        'data' => null,  // 显式为 null，不返回数据实体
+        'message' => '',
+        'redirect' => route('portal.profile.edit', $user->id),
+    ];
+
+    return response()->json($response);
+}
+```
+
+**响应结构**：
+```json
+{
+  "success": true,
+  "error": false,
+  "data": null,
+  "message": "",
+  "redirect": "/portal/profile/1/edit"
+}
+```
+
+#### 3.3.6 子模式 F：API Key 等特殊操作（无 data 字段）
+
+**代码位置**：如 `app/Http/Controllers/Modules/ApiKey.php` 第 30-45 行
+
+**特征**：
+- 不涉及 Model 操作（保存的是 setting 配置）
+- 响应中没有 `data` 字段
+
+**代码示例**：
+```php
+public function store(Request $request)
+{
+    setting()->set('apps.api_key', $request['api_key']);
+    setting()->save();
+
+    return response()->json([
+        'success' => true,
+        'error' => false,
+        'redirect' => route('apps.home.index'),
+        'message' => '',
+    ]);
+}
+```
+
+**响应结构**：
+```json
+{
+  "success": true,
+  "error": false,
+  "redirect": "/apps/home",
+  "message": ""
+}
+```
+
+#### 3.3.7 子模式 G：模块列表等（混合字段）
+
+**代码位置**：如 `app/Http/Controllers/Modules/Tiles.php` 第 224-231 行
+
+**特征**：
+- `data` 字段不存在，使用自定义字段名（如 `modules`）
+- 数据来自外部 API 而非本地 Model
+- 同时包含 `html` 和数据字段
+
+**响应结构**：
+```json
+{
+  "success": true,
+  "error": false,
+  "message": "null",
+  "modules": [ /* 外部 API 返回的模块列表 */ ],
+  "last_page": 3,
+  "html": "<div>...</div>"
+}
+```
 
 ---
 
 ### 3.4 三类模式对比总结
 
-| 模式 | 使用场景 | data 字段来源 | 外层包装 | 典型方法 |
-|------|----------|--------------|----------|----------|
-| **通用包装** | 读操作 `index`/`show` | 视图第一个变量 → Model `toArray()` | `{success, error, data, message}` | `$this->response()` → `toJson()` |
-| **直接返回** | 写操作 `store`/`update`/`enable` 等 | `ajaxDispatch()` 中 job 返回值 → Model `toArray()` | `{success, error, data, message, redirect}` | `ajaxDispatch()` → `response()->json()` |
-| **特殊接口** | Modal、autocomplete、config 等 | 手动构造（HTML 字符串 / 修改后的 Model / 简单对象） | 不固定 | 直接 `response()->json()` |
+| 模式 | 使用场景 | data 字段来源 | data 实际类型 | 外层包装 |
+|------|----------|--------------|-------------|----------|
+| **通用包装** | 读操作 | 视图第一个变量 | Model 集合 / Model | `{success, error, data, message}` |
+| **直接返回-创建/更新** | store/update/enable/disable | Job 返回的 Model | `Model->toArray()` | `{success, error, data, message, redirect}` |
+| **直接返回-删除** | destroy | Job 返回的 `true` | `bool true` | `{success, error, data, message, redirect}` |
+| **特殊-Modal展示** | create/edit 弹窗 | 手动构造 | 关联数组 `{title, buttons}` | `{success, error, message, html, data?}` |
+| **特殊-Modal保存** | store 弹窗 | Job 返回的 Model | `Model->toArray()` | `{success, error, data, message, redirect?}` |
+| **特殊-autocomplete** | 自动补全 | 修改后的 Model 集合 | `Collection->toArray()` + 动态属性 | `{success, message, errors, count, data}` |
+| **特殊-config** | 配置查询 | 外部库对象 | `stdClass` | 无包装，直接输出 |
+| **特殊-手动null** | Profile 更新等 | 显式 `null` | `null` | `{success, error, data, message, redirect}` |
+| **特殊-无data** | API Key 等 | 不存在 | 无 | `{success, error, redirect, message}` |
+| **特殊-混合字段** | 模块列表 | 外部 API 数据 | 不固定 | `{success, error, message, modules, html}` |
+
+---
+
+### 3.5 "完整 Model 序列化"的精确边界
+
+当 `data` 字段包含 Model 对象时，`response()->json()` 会调用 `Model->toArray()`，其序列化内容为：
+
+```
+Model->toArray() = 数据库字段（经字段访问器转换）
+                 + $appends 中的虚拟访问器
+                 + eager loaded 关联（原始 Model）
+                 + 运行时动态属性（如 $item->total = $total）
+                 - $hidden 中的字段
+```
+
+**以下情况不是"完整 Model 序列化"**：
+
+| 情况 | data 实际值 | 与完整序列化的差异 |
+|------|------------|-------------------|
+| 删除操作 `destroy` | `bool true` | 完全不是 Model，是布尔值 |
+| Modal 展示 `create`/`edit` | 手动数组 `{title, buttons}` | 是 UI 控制数据，不是 Model |
+| `config` 接口 | `stdClass`（来自外部库） | 字段名和值与 Model 不同 |
+| Profile 更新 | `null` | 显式不返回数据 |
+| API Key 保存 | 无 data 字段 | 不返回数据 |
+| autocomplete | 修改后的 Model 集合 | 比完整序列化多了运行时动态属性 |
 
 ---
 

@@ -17,6 +17,7 @@ HTTP Request → 路由匹配 ({company_id} 前缀) → IdentifyCompany 中间�
 Job 入队 → createPayloadUsing 注入 company_id → 存储到队列驱动
     → Worker 取出任务 → JobProcessing 事件
     → 从 payload 读取 company_id → company()->makeCurrent() → registerModules()
+    → Laravel 反序列化 Job 对象（⚠️ 此处关键时序）
     → Job::handle() 执行 → 完成/失败
 
 定时任务路径：
@@ -317,6 +318,8 @@ public function apply(Builder $builder, Model $model)
 1. **设置 `$tenantable = false`**：在模型中声明，`isTenantable()` 将返回 false
 2. **`company_id` 不在 `$fillable` 中**：`isTenantable()` 会检查 `in_array('company_id', $this->getFillable())`
 
+**特别注意**：`Company` 模型本身 `$fillable` 中不含 `company_id`，因此**不会被 Company Scope 过滤**。这是设计使然——上下文未建立时也需要能查询 Company 表。
+
 ### 5.4 临时绕过过滤
 
 使用 `allCompanies()` scope 可临时绕过：
@@ -447,6 +450,7 @@ Web 请求线程（公司A上下文）：
   │  3. ↓ createPayloadUsing 钩子触发
   │  4. payload.company_id = 1  ← 注入到顶层
   │  5. payload.data.command = serialize(SendInvoiceNotification)
+  │     ($invoice 模型被 SerializesModels 转换为仅含 ID)
   │  6. 整个 payload 写入数据库/Redis 队列
   └─ 响应返回用户
 
@@ -456,13 +460,16 @@ Worker 进程：
   │  2. ↓ JobProcessing 事件触发
   │  3. company(1)->makeCurrent()    ← 恢复公司A上下文
   │  4. $this->registerModules()     ← 加载公司A启用的模块
-  │  5. ↓ Laravel 反序列化 Job 对象
-  │     （由于使用 SerializesModels，$invoice 仅存 ID，此时 DB Scope 已生效）
+  │  5. ↓ Laravel 反序列化 Job 对象（__unserialize）
+  │     → getRestoredPropertyValue()
+  │       → restoreModel()
+  │         → newQueryForRestoration()  ← ⚠️ 此处调用 withoutGlobalScopes()
+  │         → SELECT * FROM documents WHERE id = ?  ← 无 company_id 条件！
   │  6. ↓ Job::handle() 执行
-  │     此时 setting() = 公司A的配置，Eloquent 查询自动带 company_id=1
-  │     $invoice->company->name 取的是公司A的公司名
+  │     此时 setting() = 公司A的配置，新 Eloquent 查询自动带 company_id=1
+  │     但反序列化得到的 $invoice 本身可能来自任意公司（如果 payload 被篡改）
   │  7. ↓ JobProcessed 事件（当前未做上下文清理）
-  └─ Worker 等待下一个任务（注意：容器中仍保留 company_id=1）
+  └─ Worker 等待下一个任务（容器中仍保留 company_id=1）
 ```
 
 #### 6.2.3 Worker 常驻的注意事项
@@ -527,11 +534,39 @@ abstract class JobShouldQueue implements ShouldQueue
 }
 ```
 
-**`SerializesModels` 与上下文恢复的配合**：
-1. 入队序列化时：所有 Eloquent Model 属性（如 `$this->model`、`$this->invoice`）转换为仅含主键的引用标识
-2. 出队反序列化时：Laravel 会用主键重新从 DB 查询模型
-3. **关键点**：反序列化发生在 `JobProcessing` 事件**之后**（即 `makeCurrent()` 已执行），因此 `Global Scope` 此时已生效，查询会自动限定 `company_id`
-4. 即使攻击者篡改 payload 中序列化数据的 Model ID，Scope 也会阻止跨公司数据泄露
+**`SerializesModels` 与上下文恢复的配合（⚠️ 关键安全分析）**：
+
+1. 入队序列化时：所有 Eloquent Model 属性（如 `$this->model`、`$this->invoice`）转换为仅含主键的 `ModelIdentifier`
+2. 出队反序列化时：Laravel 调用 `restoreModel()` 用主键重新查询数据库
+3. **核心问题**：`restoreModel()` 内部调用 `newQueryForRestoration()`，该方法**明确跳过所有 Global Scope**（包括 Company Scope）
+4. **时序保护**：反序列化发生在 `JobProcessing` 事件**之后**（即 `makeCurrent()` 已执行），但 `newQueryForRestoration()` 会忽略这一点，仍然跳过 Scope
+
+**Laravel 源码确认**（`vendor/laravel/framework/src/Illuminate/Queue/SerializesAndRestoresModelIdentifiers.php`）：
+```php
+protected function getQueryForModelRestoration($model, $ids)
+{
+    return $model->newQueryForRestoration($ids);
+}
+```
+
+而 `newQueryForRestoration()` 内部（`Illuminate/Database/Eloquent/Builder.php`）：
+```php
+public function newQueryForRestoration($ids)
+{
+    // ⚠️ 注意：使用的是 newQueryWithoutScopes()
+    return $this->newQueryWithoutScopes()->whereIn(
+        $this->getQualifiedKeyName(), Arr::wrap($ids)
+    );
+}
+```
+
+**Akaunting 没有自定义覆盖**：代码搜索确认，Akaunting 未重写 `getQueryForModelRestoration()`、`restoreModel()`、`getRestoredPropertyValue()` 或 `__unserialize()` 中的任何一个。
+
+**实际安全边界**：
+- ✅ 如果 payload 未被篡改，反序列化查询的 ID 是派发时确定的，属于正确的公司，即使跳过 Scope 也没问题
+- ✅ 反序列化恢复模型后，`Job::handle()` 中的**所有新查询**仍会正常应用 Company Scope
+- ✅ 模型关联查询（`$invoice->items`）也会应用 Scope（因为关联查询走的是正常的 `newQuery()`）
+- ❌ 如果攻击者能篡改队列 payload（SQL 注入修改 `jobs` 表、Redis 写入权限），将 `invoice_id` 改为其他公司的有效 ID，反序列化会成功加载跨公司数据
 
 #### 层级三：Eloquent 关联隐式获取（Notification 类）
 
@@ -612,7 +647,155 @@ if (should_queue()) {
 4. **自定义 Eloquent 方法缺失**：模块通过 `Builder::macro()` 注册的查询方法无法调用
 5. **任务调度丢失**：模块在 `boot()` 中动态注册的 Cron 调度不会生效
 
-### 6.5 定时任务中的典型模式
+### 6.5 通知任务的公司隔离风险分析
+
+通知任务由于其特殊的触发方式和收件人模型，面临独特的隔离风险：
+
+#### 风险1：通知内容泄露
+
+**场景**：发票付款提醒通知 `app/Notifications/Sale/Invoice.php`
+
+```php
+// 序列化时：$invoice 只存 ID
+// 反序列化时：newQueryForRestoration() 跳过 Company Scope
+// 如果 payload 中 invoice_id 被篡改 → 加载其他公司的发票
+public function getTagsReplacement(): array
+{
+    return [
+        '{invoice_number}' => $this->invoice->document_number,  // ⚠️ 跨公司数据
+        '{invoice_amount}' => money($this->invoice->amount),    // ⚠️ 跨公司数据
+        '{customer_name}' => $this->invoice->contact->name,     // ⚠️ 关联查询受 Scope 保护
+        '{company_name}' => $this->invoice->company->name,       // ⚠️ 关联查询受 Scope 保护
+    ];
+}
+```
+
+**防护层级分析**：
+- `$this->invoice->document_number`：直接从反序列化的模型属性读取，**无 Scope 保护**
+- `$this->invoice->contact->name`：通过关联查询，**受 Scope 保护**（因为 `contact()` 关联走正常的 `newQuery()`）
+- `$this->invoice->company->name`：通过关联查询，**受 Scope 保护**
+
+#### 风险2：收件人越权
+
+通知通过 `$notifiable`（通常是 User 模型）发送。如果 `$notifiable` 也通过 `SerializesModels` 序列化：
+- 反序列化时同样跳过 Company Scope
+- 可能导致跨公司用户发送通知
+- 但 `$notifiable` 通常是 `auth()->user()`，在派发时就确定，payload 篡改需要同时改多个字段
+
+#### 风险3：邮件发件人身份伪造
+
+`initMailMessage()` 使用 `config('mail.from')`，该配置由 `makeCurrent()` + `Overrider::load('settings')` 设置。
+- 如果上下文恢复到错误的公司，邮件会以错误的公司名义发出
+- 攻击者可能利用此伪造发件人身份进行钓鱼
+
+### 6.6 导入导出任务的公司隔离风险分析
+
+#### 6.6.1 导出任务（Export 抽象类）
+
+`app/Abstracts/Export.php` 实现了 `ShouldQueue` 但**不使用 `SerializesModels`**，而是使用 Maatwebsite Excel 的 `Exportable` trait。
+
+**安全链路分析**：
+
+```php
+// 构造时保存 ID 数组（普通属性，完整序列化）
+public function __construct($ids = null)
+{
+    $this->ids = $ids;
+    // ...
+}
+
+// collection() 中查询数据
+public function collection()
+{
+    // collectForExport 是一个普通 Local Scope
+    return Model::with('category')->collectForExport($this->ids);
+}
+```
+
+`collectForExport` scope 定义在 `app/Abstracts/Model.php`：
+```php
+public function scopeCollectForExport($query, $ids = [], $sort = 'name', $id_field = 'id')
+{
+    if (!empty($ids)) {
+        $query->whereIn($id_field, (array) $ids);  // 普通 whereIn
+    }
+    // ... 搜索、排序、分页 ...
+    return $query->cursor();  // ⚠️ 注意：此处没有 withoutGlobalScopes()
+}
+```
+
+**关键结论**：`collectForExport` 是一个普通 Local Scope，**不会移除 Company Global Scope**。因此：
+- ✅ 即使 `$this->ids` 被篡改包含其他公司的 ID，Company Scope 也会追加 `WHERE company_id = ?`
+- ✅ 最终 SQL 为 `WHERE id IN (1,2,3) AND company_id = 1`，仅返回当前公司的记录
+- ✅ 相对安全，但如果 `$ids` 被恶意修改且正好包含当前公司的未授权 ID，仍可能越权导出
+
+**批量导出的特殊风险**：`app/Jobs/Common/CreateZipForDownload.php`
+```php
+class CreateZipForDownload extends JobShouldQueue  // 使用 SerializesModels！
+{
+    public $selected;  // ID 数组
+    public $class;     // PDF 生成类名
+
+    public function handle()
+    {
+        // 路径中使用 company_id()
+        $folder_path = 'temp/' . company_id() . '/bulk_actions/';
+
+        foreach ($this->selected as $selected) {
+            // $this->class 通常是 InvoicePDF 类，内部会查询数据库
+            $pdf_path = $this->dispatch(new $this->class($selected, $folder_path));
+            // ...
+        }
+    }
+}
+```
+- `$selected` 是普通数组，序列化时完整保留
+- 但 `$this->dispatch()` 的内部类如果使用模型查询，受 Scope 保护
+- `company_id()` 用于路径拼接，如果上下文错误，会写入错误的目录
+
+#### 6.6.2 导入任务（Import 抽象类）
+
+`app/Abstracts/Import.php` 同样实现 `ShouldQueue` 但不使用 `SerializesModels`。
+
+**安全链路分析**：
+
+```php
+// map() 中显式设置 company_id
+public function map($row): array
+{
+    $row['company_id'] = company_id();  // ⚠️ 依赖上下文正确
+    $row['created_by'] = $this->getCreatedById($row);
+    // ...
+    return $row;
+}
+
+// model() 中创建新模型
+public function model(array $row)
+{
+    if (self::hasRow($row)) {  // 重复检查
+        return;
+    }
+    return new Model($row);  // $row 中已包含 company_id
+}
+
+// hasRow() 中的查询受 Scope 保护
+public function hasRow($row)
+{
+    // ...
+    $this->has_row = $this->model::withoutEvents(function () {
+        return $this->model::get($this->columns);  // ✅ 受 Company Scope 保护
+    });
+    // ...
+}
+```
+
+**关键风险点**：
+1. **上下文依赖强**：`$row['company_id'] = company_id()` 完全依赖上下文正确恢复
+2. **导入数据污染**：如果上下文恢复失败（`company_id()` 返回 `null`），所有导入行的 `company_id` 为 `null`，导致数据归属错误
+3. **重复检查漏洞**：`hasRow()` 中查询受 Scope 保护，但如果上下文错误，可能错误地判断"不存在重复"而导致跨公司数据重复
+4. **分类 ID 解析**：`getCategoryId()` 通过名称查找分类 ID，查找受 Scope 保护，相对安全
+
+### 6.7 定时任务中的典型模式
 
 三个定时任务（`app/Console/Commands/RecurringCheck.php`、`app/Console/Commands/InvoiceReminder.php`、`app/Console/Commands/BillReminder.php`）均遵循"遍历所有公司 → 切换上下文 → 处理 → 清理"模式：
 
@@ -640,9 +823,9 @@ public function handle()
 }
 ```
 
-### 6.6 各定时任务的上下文管理分析
+### 6.8 各定时任务的上下文管理分析
 
-#### 6.6.1 `recurring:check` — 重复账单检查
+#### 6.8.1 `recurring:check` — 重复账单检查
 
 `app/Console/Commands/RecurringCheck.php`：
 
@@ -658,7 +841,7 @@ public function handle()
 
 **注意**：`RecurringCheck` 是 Artisan 命令，不经过 Queue 的 `JobProcessing` 钩子，因此 `registerModules()` **未自动调用**。如果重复账单生成依赖模块的事件监听器（如电子发票模块需要在 `DocumentCreated` 时生成 XML），需要在该命令中显式调用。
 
-#### 6.6.2 `reminder:invoice` / `reminder:bill` — 催款提醒
+#### 6.8.2 `reminder:invoice` / `reminder:bill` — 催款提醒
 
 `app/Console/Commands/InvoiceReminder.php`：
 
@@ -679,11 +862,11 @@ Company::forgetCurrent();
 
 在 `remind()` 方法内部通过 `event(new DocumentReminded($invoice, Notification::class))` 触发通知发送，`Notification` 类如果走异步队列会再次经过 `createPayloadUsing` + `JobProcessing` 的完整上下文传递链。
 
-### 6.7 上下文切换在后台任务中的连锁效应汇总
+### 6.9 上下文切换在后台任务中的连锁效应汇总
 
 | 影响维度 | 具体表现 |
 |---------|---------|
-| **Eloquent 查询** | 无需手动加 `where('company_id', x)`，Global Scope 自动追加 |
+| **Eloquent 查询** | 无需手动加 `where('company_id', x)`，Global Scope 自动追加（反序列化恢复除外） |
 | **设置读取** | `setting('schedule.send_invoice_reminder')` 读取当前公司配置 |
 | **时区** | `Overrider::load('settings')` 会覆盖 `config('app.timezone')`，`Date::now()` 随之变化 |
 | **邮件配置** | `mail.from`、SMTP 服务器等均为该公司配置，发送邮件时自动使用 |
@@ -693,7 +876,7 @@ Company::forgetCurrent();
 | **缓存命名空间** | `cache_prefix()` = `{company_id}_`，避免跨公司缓存污染 |
 | **搜索字符串配置** | `categoryTypes` 已被 `loadCategoryTypes()` 重写为公司自定义分类类型 |
 
-### 6.8 Schedule 调度器注册
+### 6.10 Schedule 调度器注册
 
 `app/Console/Kernel.php`：
 
@@ -716,11 +899,237 @@ protected function schedule(Schedule $schedule)
 
 ---
 
-## 七、Overrider：公司级配置覆盖
+## 七、队列模型反序列化与公司隔离的深度分析
+
+### 7.1 核心问题：`newQueryForRestoration()` 跳过 Global Scope
+
+#### 7.1.1 Laravel 原生行为确认
+
+Laravel 的 `SerializesModels` trait 在反序列化恢复模型时，**明确设计为跳过所有 Global Scope**。这是 Laravel 框架的有意设计，目的是：
+- 确保即使模型被软删除（`SoftDeletingScope`）也能被恢复
+- 确保队列任务能够获取到派发时引用的精确数据，不受当前上下文过滤规则影响
+
+**调用链路**：
+```
+__unserialize()
+  → getRestoredPropertyValue($value)
+    → restoreModel($value) 或 restoreCollection($value)
+      → getQueryForModelRestoration($model, $ids)
+        → $model->newQueryForRestoration($ids)
+          → $this->newQueryWithoutScopes()->whereIn(...)  // ⚠️ 移除所有 Scope
+```
+
+#### 7.1.2 对 Akaunting 公司隔离的影响
+
+Company Scope 作为一个 Global Scope，在反序列化恢复时会被跳过，导致：
+
+| 查询场景 | Company Scope 是否生效 | SQL 示例 |
+|---------|----------------------|---------|
+| 普通查询 `Document::find(123)` | ✅ 是 | `SELECT * FROM documents WHERE id = 123 AND company_id = 1` |
+| 关联查询 `$invoice->items` | ✅ 是 | `SELECT * FROM document_items WHERE document_id = 123 AND company_id = 1` |
+| 反序列化恢复 | ❌ 否 | `SELECT * FROM documents WHERE id = 123`（无 company_id） |
+
+#### 7.1.3 Akaunting 是否有额外限制？
+
+**答案：没有**。代码搜索确认：
+
+- ❌ 没有重写 `getQueryForModelRestoration()`
+- ❌ 没有重写 `restoreModel()`
+- ❌ 没有重写 `getRestoredPropertyValue()`
+- ❌ 没有重写 `__unserialize()`
+- ❌ 没有为队列反序列化添加 `company_id` 校验逻辑
+
+完全依赖 Laravel 原生行为。
+
+### 7.2 实际攻击面与防护分析
+
+#### 7.2.1 攻击前提条件
+
+要利用此漏洞跨公司访问数据，攻击者需要：
+
+1. **队列存储写入权限**：
+   - Database 驱动：需要 SQL 注入漏洞修改 `jobs` 表的 `payload` 字段
+   - Redis 驱动：需要 Redis 服务器写入权限
+   - 同步驱动（`sync`）：不存在队列存储，无此风险
+
+2. **知道目标数据的主键 ID**：
+   - 由于只能通过主键查询，攻击者需要知道或猜测其他公司数据的 ID
+   - 自增 ID 容易猜测（如 `id = 1` 几乎必然存在）
+
+3. **绕过 payload 签名（如果启用）**：
+   - Laravel 队列默认不对 payload 进行签名
+   - 如需签名需自定义 `createPayloadUsing` 逻辑
+
+#### 7.2.2 现有防护层级
+
+虽然反序列化查询本身跳过 Scope，但系统存在多层防护降低实际风险：
+
+| 防护层级 | 保护对象 | 实现方式 | 强度 |
+|---------|---------|---------|------|
+| 1. 队列存储访问控制 | 所有队列任务 | Database/Redis 权限隔离 | 强 |
+| 2. payload company_id 绑定 | 上下文恢复 | `JobProcessing` 中根据 payload.company_id 调用 `makeCurrent()` | 中 |
+| 3. 模型属性 company_id 校验 | 业务逻辑 | `$model->company_id == company_id()` 手动校验 | 弱（代码中不普遍） |
+| 4. 后续查询 Scope 保护 | 新查询和关联查询 | 正常查询仍然应用 Company Scope | 强 |
+| 5. 收件人限制 | 通知任务 | 通知发送给 `$notifiable`（派发时确定） | 中 |
+
+#### 7.2.3 高风险场景
+
+**场景 A：发票通知内容泄露**
+```php
+// 攻击者篡改 jobs 表 payload：
+// - company_id: 1（正常）
+// - data.command 中序列化的 invoice.id: 999（其他公司的发票ID）
+
+// 反序列化结果：$invoice 是公司 2 的 ID=999 的发票
+// 但上下文是公司 1
+
+public function toMail($notifiable)
+{
+    return (new MailMessage)
+        ->line('Invoice #' . $this->invoice->document_number)  // ⚠️ 泄露公司 2 的发票号
+        ->line('Amount: ' . money($this->invoice->amount))       // ⚠️ 泄露公司 2 的金额
+        ->action('View', route('invoices.show', $this->invoice)); // ✅ 链接带 company_id=1，但 ID=999 不存在于公司 1，点击 404
+}
+```
+
+**场景 B：批量下载路径污染**
+```php
+// 正常：company_id = 1
+// 篡改后：company_id = 2
+
+public function handle()
+{
+    // 路径使用被篡改的 company_id
+    $folder_path = 'temp/' . company_id() . '/bulk_actions/';
+    // 文件被写入公司 2 的目录，可能覆盖合法数据
+}
+```
+
+**场景 C：Worker 上下文残留**
+```
+1. 任务 A（公司 1）执行完成，未清理上下文
+2. 任务 B（无 company_id，如 CLI 派发的清理任务）开始执行
+3. 任务 B 中 `company_id()` 返回 1（来自残留）
+4. 任务 B 可能错误地清理或修改公司 1 的数据
+```
+
+### 7.3 不同任务类型的风险矩阵
+
+| 任务类型 | 使用 SerializesModels | 反序列化跳过 Scope | 风险等级 | 关键风险点 |
+|---------|---------------------|-------------------|----------|-----------|
+| **通知类（Notification）** | ✅ 是（基类使用） | ✅ 是 | ⚠️ 高 | 邮件内容泄露、发件人伪造 |
+| **异步 Job（JobShouldQueue）** | ✅ 是（基类使用） | ✅ 是 | ⚠️ 高 | 业务逻辑处理跨公司数据 |
+| **导出任务（Export）** | ❌ 否（Exportable） | ❌ 否 | ✅ 低 | collectForExport 受 Scope 保护 |
+| **导入任务（Import）** | ❌ 否 | ❌ 否 | ⚠️ 中 | 依赖 company_id() 正确设置 |
+| **批量下载（CreateZipForDownload）** | ✅ 是（基类使用） | ✅ 是 | ⚠️ 中 | 路径拼接使用 company_id() |
+| **定时任务（Command）** | ❌ 否 | ❌ 否 | ✅ 低 | 手动遍历管理上下文 |
+| **同步 Job（dispatchSync）** | 取决于基类 | 不涉及 | ✅ 低 | 继承请求上下文 |
+
+### 7.4 通知任务的具体风险分析
+
+#### 7.4.1 发票/账单通知（`app/Notifications/Sale/Invoice.php`）
+
+**风险链**：
+1. 发票模型 `$invoice` 序列化时仅存 ID
+2. 反序列化时跳过 Company Scope，可加载任意公司的发票
+3. `getTagsReplacement()` 直接读取模型属性（`document_number`, `amount`），无校验
+4. 邮件内容可能包含跨公司敏感数据
+
+**已有的间接保护**：
+- `$this->invoice->company->name` 通过关联查询，受 Scope 保护。如果 `$invoice` 属于其他公司，`$invoice->company_id = 2`，关联查询 `WHERE company_id = 1 AND id = 2` 会返回 null
+- 实际测试：跨公司发票的 `company` 关联会返回 `null`，模板中可能报错或显示空白
+
+#### 7.4.2 导出完成通知（`app/Notifications/Common/ExportCompleted.php`）
+
+```php
+class ExportCompleted extends Notification implements ShouldQueue
+{
+    use Queueable;  // ⚠️ 注意：只使用了 Queueable，未使用 SerializesModels！
+
+    protected $translation;
+    protected $file_name;
+    protected $download_url;  // 下载 URL 完整传入
+
+    public function toMail($notifiable): MailMessage
+    {
+        return (new MailMessage)
+            ->from(config('mail.from.address'), config('mail.from.name'))  // 依赖上下文
+            ->action(trans('general.download'), $this->download_url);      // URL 完整传入，无校验
+    }
+}
+```
+
+**风险**：
+- 不使用 `SerializesModels`，所以没有反序列化问题
+- 但 `$download_url` 在构造时传入并完整序列化，如果派发时上下文错误，URL 会包含错误的 `company_id`
+- `config('mail.from')` 依赖 `makeCurrent()` 正确恢复
+
+### 7.5 导入导出任务的具体风险分析
+
+#### 7.5.1 导出任务的安全边界
+
+`app/Exports/Common/Sheets/Items.php` 示例：
+```php
+class Items extends Export
+{
+    public function collection()
+    {
+        // with() 关联查询 + collectForExport Local Scope
+        return Model::with('category')->collectForExport($this->ids);
+    }
+}
+```
+
+**安全分析**：
+- `with('category')` 预加载关联，关联查询受 Scope 保护
+- `collectForExport` 是 Local Scope，内部调用 `whereIn()`，**不调用 `withoutGlobalScopes()`**
+- Company Scope 正常追加 `WHERE company_id = ?`
+- **结论**：即使 `$this->ids` 被篡改，跨公司 ID 会被 Company Scope 过滤掉
+
+**例外情况**：
+- 如果模型本身设置了 `$tenantable = false`（不常见）
+- 如果导出类显式调用 `allCompanies()`（代码中未发现此模式）
+
+#### 7.5.2 导入任务的安全边界
+
+`app/Imports/Common/Sheets/Items.php` 示例：
+```php
+class Items extends Import
+{
+    public function map($row): array
+    {
+        $row = parent::map($row);  // 调用父类 map，设置 company_id
+        // ...
+        return $row;
+    }
+}
+```
+
+父类 `map()` 方法（`app/Abstracts/Import.php`）：
+```php
+public function map($row): array
+{
+    $row['company_id'] = company_id();  // ⚠️ 单点故障
+    // ...
+    return $row;
+}
+```
+
+**风险分析**：
+- 单点依赖 `company_id()` 返回正确值
+- 如果上下文恢复失败：
+  - `$row['company_id'] = null`
+  - 新记录的 `company_id` 为 `null`，不属于任何公司
+  - 查询时 `WHERE company_id = ?` 条件不匹配，数据"消失"
+- `hasRow()` 重复检查受 Scope 保护，但在上下文为 null 时，`WHERE company_id = null` 永远不匹配，可能导致重复导入
+
+---
+
+## 八、Overrider：公司级配置覆盖
 
 `app/Utilities/Overrider.php` 在 `makeCurrent()` 中被调用三次，将公司设置同步到 Laravel Config：
 
-### 7.1 `loadSettings()` — 基础配置覆盖
+### 8.1 `loadSettings()` — 基础配置覆盖
 
 | 配置项 | 来源 (setting key) | 目标 (config key) |
 |--------|-------------------|------------------|
@@ -734,21 +1143,22 @@ protected function schedule(Schedule $schedule)
 | 默认货币 | `default.currency` | `money.defaults.currency` |
 | Money 包 Locale | app locale | `Money::setLocale()` |
 
-### 7.2 `loadCurrencies()` — 货币表加载
+### 8.2 `loadCurrencies()` — 货币表加载
 
 从 `currencies` 表（已通过 Global Scope 过滤当前公司）读取所有货币，注入到 `money.currencies.*` config，最后调用 `Currency::setCurrencies()` 刷新内存。
 
-### 7.3 `loadCategoryTypes()` — 分类类型注入
+### 8.3 `loadCategoryTypes()` — 分类类型注入
 
 读取公司自定义的收入/支出/物品/其他分类类型，更新到 `search-string` config 中的搜索字段路由参数，确保搜索下拉选项为该公司的分类配置。
 
 ---
 
-## 八、关键文件索引
+## 九、关键文件索引
 
 | 功能模块 | 文件路径 |
 |---------|---------|
 | **队列上下文自动管理（核心）** | `app/Providers/Queue.php` |
+| **队列模型反序列化风险分析** | `vendor/laravel/framework/src/Illuminate/Queue/SerializesAndRestoresModelIdentifiers.php` |
 | 公司识别中间件 | `app/Http/Middleware/IdentifyCompany.php` |
 | Company ID 解析 Trait | `app/Traits/Companies.php` |
 | Company 模型（上下文管理） | `app/Models/Common/Company.php` |
@@ -757,11 +1167,13 @@ protected function schedule(Schedule $schedule)
 | 路由分组与前缀宏 | `app/Providers/Route.php` |
 | Eloquent 全局 Scope | `app/Scopes/Company.php` |
 | 租户 Trait（boot 时注册 Scope） | `app/Traits/Tenants.php` |
-| Model 基类（默认启用 Tenants） | `app/Abstracts/Model.php` |
+| Model 基类（默认启用 Tenants + collectForExport） | `app/Abstracts/Model.php` |
 | 异步 Job 基类（SerializesModels） | `app/Abstracts/JobShouldQueue.php` |
 | 同步 Job 基类 | `app/Abstracts/Job.php` |
 | Job 派发 Trait（dispatch / dispatchSync） | `app/Traits/Jobs.php` |
 | Notification 基类（ShouldQueue） | `app/Abstracts/Notification.php` |
+| Export 抽象类（ShouldQueue + Exportable） | `app/Abstracts/Export.php` |
+| Import 抽象类（ShouldQueue + Importable） | `app/Abstracts/Import.php` |
 | 队列请求集合（替代不可序列化的 Request） | `app/Utilities/QueueCollection.php` |
 | 配置覆盖器（设置/货币/分类） | `app/Utilities/Overrider.php` |
 | 公司切换控制器 | `app/Http/Controllers/Common/Companies.php` |
@@ -777,6 +1189,9 @@ protected function schedule(Schedule $schedule)
 | 账单催款 Cron 任务（遍历模式） | `app/Console/Commands/BillReminder.php` |
 | 安装模块 Job（显式 company_id 属性） | `app/Jobs/Install/EnableModule.php` |
 | 发票 Notification（关联隐式获取） | `app/Notifications/Sale/Invoice.php` |
+| 导出完成 Notification（无 SerializesModels） | `app/Notifications/Common/ExportCompleted.php` |
 | 批量下载 Job（company_id() 直接使用） | `app/Jobs/Common/CreateZipForDownload.php` |
+| 导出 Sheet 示例（受 Scope 保护） | `app/Exports/Common/Sheets/Items.php` |
+| 导入 Sheet 示例（显式设置 company_id） | `app/Imports/Common/Sheets/Items.php` |
 | 登出清理 session | `app/Listeners/Auth/Logout.php` |
 | 事件-监听器映射表 | `app/Providers/Event.php` |

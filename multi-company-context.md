@@ -2,15 +2,26 @@
 
 ## 一、整体架构概览
 
-Akaunting 采用 **多租户共享数据库** 架构（Multi-Tenant, Shared Database），所有公司数据存储在同一数据库中，通过 `company_id` 字段进行逻辑隔离。公司上下文的生命周期贯穿 HTTP 请求处理的每个阶段：从路由解析、中间件识别、数据查询到视图渲染。
+Akaunting 采用 **多租户共享数据库** 架构（Multi-Tenant, Shared Database），所有公司数据存储在同一数据库中，通过 `company_id` 字段进行逻辑隔离。公司上下文的生命周期贯穿 HTTP 请求处理、队列任务执行、定时任务调度的每个阶段。
 
 核心组件关系：
 
 ```
+HTTP 请求路径：
 HTTP Request → 路由匹配 ({company_id} 前缀) → IdentifyCompany 中间件 
     → 解析 company_id → 权限校验 → company()->makeCurrent()
     → 加载公司设置/货币/模块 → Eloquent Global Scope 自动过滤
     → 菜单构建 → 业务逻辑 → 响应输出
+
+异步队列路径：
+Job 入队 → createPayloadUsing 注入 company_id → 存储到队列驱动
+    → Worker 取出任务 → JobProcessing 事件
+    → 从 payload 读取 company_id → company()->makeCurrent() → registerModules()
+    → Job::handle() 执行 → 完成/失败
+
+定时任务路径：
+Schedule 触发 → Artisan Command::handle()
+    → allCompanies() 遍历 → 循环内 makeCurrent() → 业务逻辑 → forgetCurrent()
 ```
 
 ---
@@ -19,9 +30,9 @@ HTTP Request → 路由匹配 ({company_id} 前缀) → IdentifyCompany 中间�
 
 ### 2.1 中间件注册与路由分组
 
-所有需要公司上下文的路由均通过 `{company_id}` URL 前缀定义，并挂载 `company.identify` 中间件（[IdentifyCompany.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Http/Middleware/IdentifyCompany.php)）。
+所有需要公司上下文的路由均通过 `{company_id}` URL 前缀定义，并挂载 `company.identify` 中间件（`app/Http/Middleware/IdentifyCompany.php`）。
 
-中间件挂载位置（[Kernel.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Http/Kernel.php#L32-L145)）：
+中间件挂载位置（`app/Http/Kernel.php`）：
 
 | 路由组       | 中间件包含 `company.identify` | URL 前缀模式                  |
 |-------------|------------------------------|-----------------------------|
@@ -33,7 +44,7 @@ HTTP Request → 路由匹配 ({company_id} 前缀) → IdentifyCompany 中间�
 | `preview`   | ✅ 是                        | `{company_id}/preview/...`  |
 | `signed`    | ✅ 是                        | `{company_id}/signed/...`   |
 
-路由宏定义（[Route.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Providers/Route.php#L40-L73)）自动为模块路由注入 `{company_id}` 前缀：
+路由宏定义（`app/Providers/Route.php`）自动为模块路由注入 `{company_id}` 前缀：
 ```php
 // 示例：Route::macro('module') 自动拼接 {company_id} 前缀
 $attributes['prefix'] = '{company_id}/' . $attrs['prefix'];
@@ -41,7 +52,7 @@ $attributes['prefix'] = '{company_id}/' . $attrs['prefix'];
 
 ### 2.2 Company ID 多源识别策略
 
-识别逻辑集中在 [Companies.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Traits/Companies.php) Trait 的 `getCompanyId()` 方法，根据请求类型采用不同的优先级策略：
+识别逻辑集中在 `app/Traits/Companies.php` Trait 的 `getCompanyId()` 方法，根据请求类型采用不同的优先级策略：
 
 #### 2.2.1 Web 请求识别 (`getCompanyIdFromWeb`)
 
@@ -68,7 +79,7 @@ $attributes['prefix'] = '{company_id}/' . $attrs['prefix'];
 
 ### 2.3 权限校验
 
-在 [IdentifyCompany.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Http/Middleware/IdentifyCompany.php#L35-L38) 中：
+在 `app/Http/Middleware/IdentifyCompany.php` 中：
 
 ```php
 // 非签名请求必须校验用户是否属于该公司
@@ -77,7 +88,7 @@ if ($this->request->isNotSigned($company_id) && $this->isNotUserCompany($company
 }
 ```
 
-用户-公司关联通过 `user_companies` 中间表维护，校验方法为 [Users::isUserCompany()](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Traits/Users.php#L27-L40)。
+用户-公司关联通过 `user_companies` 中间表维护，校验方法为 `app/Traits/Users.php::isUserCompany()`。
 
 ---
 
@@ -85,7 +96,7 @@ if ($this->request->isNotSigned($company_id) && $this->isNotUserCompany($company
 
 ### 3.1 上下文容器绑定
 
-公司上下文通过 Laravel 服务容器（Service Container）的单例绑定实现全局访问。核心方法定义在 [Company.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Models/Common/Company.php#L601-L672)：
+公司上下文通过 Laravel 服务容器（Service Container）的单例绑定实现全局访问。核心方法定义在 `app/Models/Common/Company.php`：
 
 #### 3.1.1 `makeCurrent($force = false)` — 设置当前公司
 
@@ -147,7 +158,7 @@ public static function forgetCurrent()
 
 ### 3.2 IdentifyCompany 中间件完整流程
 
-[IdentifyCompany.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Http/Middleware/IdentifyCompany.php#L25-L62) 是上下文初始化的入口：
+`app/Http/Middleware/IdentifyCompany.php` 是上下文初始化的入口：
 
 | 步骤 | 操作 | 代码位置 |
 |------|------|----------|
@@ -162,7 +173,7 @@ public static function forgetCurrent()
 
 ### 3.3 主动切换：用户点击切换公司
 
-切换入口在 [Companies::switch()](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Http/Controllers/Common/Companies.php#L226-L244)：
+切换入口在 `app/Http/Controllers/Common/Companies.php::switch()`：
 
 ```php
 public function switch(Company $company)
@@ -187,7 +198,7 @@ public function switch(Company $company)
 
 ### 3.4 事件系统
 
-公司生命周期事件定义（[Events/Common/](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Events/Common)）：
+公司生命周期事件定义（`app/Events/Common/`）：
 
 | 事件类 | 触发时机 | 用途 |
 |--------|---------|------|
@@ -199,7 +210,7 @@ public function switch(Company $company)
 
 ### 3.5 登出时的清理
 
-[Logout.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Listeners/Auth/Logout.php#L15-L18)：
+`app/Listeners/Auth/Logout.php`：
 ```php
 public function handle(Event $event)
 {
@@ -215,10 +226,10 @@ public function handle(Event $event)
 
 菜单通过中间件构建，位于 `company.identify` **之后**：
 
-- **Admin 菜单**：`menu.admin` 中间件 → [AdminMenu.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Http/Middleware/AdminMenu.php)
-- **Portal 菜单**：`menu.portal` 中间件 → [PortalMenu.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Http/Middleware/PortalMenu.php)
+- **Admin 菜单**：`menu.admin` 中间件 → `app/Http/Middleware/AdminMenu.php`
+- **Portal 菜单**：`menu.portal` 中间件 → `app/Http/Middleware/PortalMenu.php`
 
-中间件优先级（[Kernel.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Http/Kernel.php#L78-L90)）：
+中间件优先级（`app/Http/Kernel.php`）：
 ```
 admin 组顺序：
   web → auth → auth.disabled → company.identify → ... → menu.admin → permission
@@ -239,7 +250,7 @@ menu()->create('admin', function ($menu) {
 });
 ```
 
-默认菜单项由 [ShowInAdmin.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Listeners/Menu/ShowInAdmin.php) 监听器注册，通过 `canAccessMenuItem()` 进行权限判断，权限基于当前用户在**当前公司**的角色。
+默认菜单项由 `app/Listeners/Menu/ShowInAdmin.php` 监听器注册，通过 `canAccessMenuItem()` 进行权限判断，权限基于当前用户在**当前公司**的角色。
 
 ### 4.3 公司切换对菜单的影响
 
@@ -254,7 +265,7 @@ menu()->create('admin', function ($menu) {
 
 ### 5.1 Eloquent Global Scope 自动过滤
 
-核心机制：[Tenants.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Traits/Tenants.php) Trait 在模型 boot 时注册全局作用域 [Company Scope](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Scopes/Company.php)。
+核心机制：`app/Traits/Tenants.php` Trait 在模型 boot 时注册全局作用域 `app/Scopes/Company.php`。
 
 ```php
 // Tenants.php
@@ -264,7 +275,7 @@ protected static function bootTenants()
 }
 ```
 
-所有继承自 [Abstracts/Model.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Abstracts/Model.php#L21-L24) 的模型默认使用 `Tenants` Trait：
+所有继承自 `app/Abstracts/Model.php` 的模型默认使用 `Tenants` Trait：
 ```php
 abstract class Model extends Eloquent implements Ownable
 {
@@ -275,7 +286,7 @@ abstract class Model extends Eloquent implements Ownable
 
 ### 5.2 Scope 过滤逻辑
 
-[Company.php (Scope)](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Scopes/Company.php#L21-L50) 的 `apply()` 方法：
+`app/Scopes/Company.php` 的 `apply()` 方法：
 
 ```php
 public function apply(Builder $builder, Model $model)
@@ -325,7 +336,7 @@ $recurring = Recurring::with('company')
 
 ### 5.5 设置（Settings）的特殊处理
 
-公司设置通过 [akaunting/setting](https://github.com/akaunting/setting) 包管理，使用 `extra_columns` 机制：
+公司设置通过 `akaunting/setting` 包管理，使用 `extra_columns` 机制：
 
 ```php
 // makeCurrent() 中
@@ -338,7 +349,7 @@ setting()->load(true);                                    // 重新加载
 
 ### 5.6 缓存前缀隔离
 
-[helpers.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Utilities/helpers.php#L158-L166) 中定义：
+`app/Utilities/helpers.php` 中定义：
 ```php
 function cache_prefix(): string
 {
@@ -346,7 +357,7 @@ function cache_prefix(): string
 }
 ```
 
-结合 `laravel-model-caching`（[Model.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Abstracts/Model.php#L23) 中使用了 `Cachable` Trait），确保各公司查询缓存互不干扰。
+结合 `laravel-model-caching`（`app/Abstracts/Model.php` 中使用了 `Cachable` Trait），确保各公司查询缓存互不干扰。
 
 ---
 
@@ -354,11 +365,256 @@ function cache_prefix(): string
 
 ### 6.1 后台任务的特殊性
 
-后台命令（Artisan Command）和队列任务（Job）**不经过 HTTP 中间件栈**，因此 `IdentifyCompany` 不会自动执行。开发人员必须手动管理公司上下文。
+后台命令（Artisan Command）和队列任务（Job）**不经过 HTTP 中间件栈**，因此 `IdentifyCompany` 不会自动执行。但队列任务和 Console 命令采用了不同的上下文管理策略：
 
-### 6.2 定时任务中的典型模式
+| 场景 | 上下文管理方式 | 代码位置 |
+|------|--------------|---------|
+| HTTP 请求 | `IdentifyCompany` 中间件自动处理 | `app/Http/Middleware/IdentifyCompany.php` |
+| Artisan 定时任务 | 开发人员手动遍历 + `makeCurrent()` | 各 Command::handle() |
+| 异步队列 Job | `Queue ServiceProvider` 自动注入+恢复 | `app/Providers/Queue.php` |
+| 同步 Job (`dispatchSync`) | 继承派发时的请求上下文，无需处理 | 隐式 |
 
-三个定时任务（[RecurringCheck.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Console/Commands/RecurringCheck.php)、[InvoiceReminder.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Console/Commands/InvoiceReminder.php)、[BillReminder.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Console/Commands/BillReminder.php)）均遵循"遍历所有公司 → 切换上下文 → 处理 → 清理"模式：
+### 6.2 异步队列：公司编号的自动传递与恢复
+
+#### 6.2.1 核心机制：Queue ServiceProvider
+
+`app/Providers/Queue.php` 是异步队列上下文管理的**唯一入口**，通过两个钩子实现全自动传递恢复：
+
+**钩子一：入队时注入 company_id（createPayloadUsing）**
+
+```php
+// 每当一个 Job 被序列化推入队列时触发
+app('queue')->createPayloadUsing(function ($connection, $queue, $payload) {
+    $company_id = company_id();  // 读取派发时刻的当前上下文
+
+    if (empty($company_id)) {
+        return [];  // 如果派发时无上下文（如纯 CLI 环境），不注入
+    }
+
+    return ['company_id' => $company_id];  // 附加到队列 payload 顶层
+});
+```
+
+**关键特性**：
+- `company_id` 存放在 payload 的**顶层**（而非 `data.command` 内部），Laravel 反序列化 Job 对象时不会自动处理
+- 仅当 `company_id()` 非空时才注入，因此从 Console（无上下文）派发的任务不会带 company_id
+- 对**所有** `ShouldQueue` 接口的实例生效：包括 `JobShouldQueue` 子类、`Notification`、自定义 `ShouldQueue` 事件监听器等
+
+**钩子二：出队时恢复上下文（JobProcessing 事件）**
+
+```php
+// 每当 Worker 从队列取出一个 Job 准备执行前触发
+app('events')->listen(JobProcessing::class, function ($event) {
+    $payload = $event->job->payload();
+
+    // 1. 提取注入的 company_id
+    if (! array_key_exists('company_id', $payload)) {
+        return;  // 无 company_id 则跳过（如纯 CLI 派发的任务）
+    }
+
+    // 2. 加载 Company 模型，异常或不存在则删除任务
+    try {
+        $company = company($payload['company_id']);
+    } catch (\Throwable $e) {
+        $event->job->delete();  // 静默删除，避免反复重试
+        logger()->warning('Company could not be resolved...', [...]);
+        return;
+    }
+
+    if (empty($company)) {
+        $event->job->delete();
+        logger()->warning('Company not found, job deleted.', [...]);
+        return;
+    }
+
+    // 3. 恢复上下文（与 HTTP 中间件中的 L47 完全相同）
+    $company->makeCurrent();
+
+    // 4. 注册该公司启用的模块（仅在真实异步场景下）
+    if (should_queue()) {
+        $this->registerModules();  // 加载模块的事件监听器、路由、视图等
+    }
+});
+```
+
+#### 6.2.2 异步任务完整生命周期时序
+
+```
+Web 请求线程（公司A上下文）：
+  ┌─ 用户提交操作
+  │  1. 当前上下文：company_id = 1（公司A）
+  │  2. dispatch(new SendInvoiceNotification($invoice))
+  │  3. ↓ createPayloadUsing 钩子触发
+  │  4. payload.company_id = 1  ← 注入到顶层
+  │  5. payload.data.command = serialize(SendInvoiceNotification)
+  │  6. 整个 payload 写入数据库/Redis 队列
+  └─ 响应返回用户
+
+Worker 进程：
+  ┌─ queue:work 循环取出任务
+  │  1. 从队列读取 payload → 解析出 company_id=1 和序列化的 Job 对象
+  │  2. ↓ JobProcessing 事件触发
+  │  3. company(1)->makeCurrent()    ← 恢复公司A上下文
+  │  4. $this->registerModules()     ← 加载公司A启用的模块
+  │  5. ↓ Laravel 反序列化 Job 对象
+  │     （由于使用 SerializesModels，$invoice 仅存 ID，此时 DB Scope 已生效）
+  │  6. ↓ Job::handle() 执行
+  │     此时 setting() = 公司A的配置，Eloquent 查询自动带 company_id=1
+  │     $invoice->company->name 取的是公司A的公司名
+  │  7. ↓ JobProcessed 事件（当前未做上下文清理）
+  └─ Worker 等待下一个任务（注意：容器中仍保留 company_id=1）
+```
+
+#### 6.2.3 Worker 常驻的注意事项
+
+由于 `php artisan queue:work` 是常驻进程，存在以下影响：
+
+| 问题 | 表现 | 风险 |
+|------|------|------|
+| **上下文残留** | 前一个 Job 执行后，`Company::getCurrent()` 仍保留在容器中 | 下一个无 company_id 的 Job 会无意中继承错误上下文 |
+| **配置残留** | `Overrider::load()` 修改的是 `config()` 全局状态 | 后续任务如果上下文切换失败，会读到上一个公司的时区/邮件/货币配置 |
+| **模块残留** | `registerModules()` 加载的监听器不会自动卸载 | 已禁用模块的监听器可能仍在后续任务中被触发 |
+
+**代码中未处理**：`app/Providers/Queue.php` 中没有注册 `JobProcessed` 事件监听器来清理上下文。这在多公司混合队列场景下是潜在的风险点。
+
+### 6.3 异步任务中 company_id 的传递层级
+
+除了 `Queue ServiceProvider` 的自动机制外，代码中还存在三层**手动**传递策略：
+
+#### 层级一：Job 属性显式保存（安装模块类 Job）
+
+典型模式见 `app/Jobs/Install/EnableModule.php`：
+```php
+class EnableModule extends Job  // 同步 Job 基类，不 implements ShouldQueue
+{
+    protected $alias;
+    protected $company_id;    // ← 显式属性
+    protected $locale;
+
+    public function __construct($alias, $company_id, $locale = null)
+    {
+        $this->alias = $alias;
+        $this->company_id = (int) $company_id;
+        $this->locale = $locale ?: company($company_id)->locale ?: config('setting.fallback.default.locale');
+        // 构造时就利用上下文取 locale
+    }
+
+    public function handle()
+    {
+        // 注意：此 Job 不走自动恢复，handle() 内必须自己确保上下文
+        $command = "module:enable {$this->alias} {$this->company_id} {$this->locale}";
+        Console::run($command);  // 通过 artisan 参数传递给子命令
+    }
+}
+```
+
+同类模式也出现在：
+- `app/Jobs/Install/DisableModule.php`
+- `app/Jobs/Install/DownloadModule.php`
+
+这些 Job 虽然保存了 `$company_id`，但属于**同步基类**（继承 `App\Abstracts\Job` 而非 `JobShouldQueue`），通常在 `dispatchSync` 中运行，依赖派发时已经存在的上下文。
+
+#### 层级二：JobShouldQueue 基类 + SerializesModels
+
+`app/Abstracts/JobShouldQueue.php` 是异步 Job 的基类：
+```php
+abstract class JobShouldQueue implements ShouldQueue
+{
+    use InteractsWithQueue, Jobs, Queueable, Relationships,
+        SerializesModels,   // ← 关键：Eloquent 模型序列化时只存 ID
+        Sources, Uploads;
+    // ...
+}
+```
+
+**`SerializesModels` 与上下文恢复的配合**：
+1. 入队序列化时：所有 Eloquent Model 属性（如 `$this->model`、`$this->invoice`）转换为仅含主键的引用标识
+2. 出队反序列化时：Laravel 会用主键重新从 DB 查询模型
+3. **关键点**：反序列化发生在 `JobProcessing` 事件**之后**（即 `makeCurrent()` 已执行），因此 `Global Scope` 此时已生效，查询会自动限定 `company_id`
+4. 即使攻击者篡改 payload 中序列化数据的 Model ID，Scope 也会阻止跨公司数据泄露
+
+#### 层级三：Eloquent 关联隐式获取（Notification 类）
+
+`app/Notifications/Sale/Invoice.php` 等通知类不保存 company_id，但通过模型关联隐式获取：
+```php
+class Invoice extends Notification  // Notification 基类已 implements ShouldQueue
+{
+    public $invoice;  // ← 整个 Document 模型，序列化时只存 ID
+
+    public function getTagsReplacement(): array
+    {
+        return [
+            // ...
+            $this->invoice->company->name,    // ← 关联查询时 Scope 已生效
+            $this->invoice->company->email,
+            // ...
+            'company_id' => $this->invoice->company_id,  // ← 模型属性直接取
+        ];
+    }
+
+    public function toMail($notifiable): MailMessage
+    {
+        $message = $this->initMailMessage();  // ← 内部调用 company_id()
+        // ...
+    }
+}
+```
+
+在 `app/Abstracts/Notification.php` 中：
+```php
+public function initMailMessage(): MailMessage
+{
+    app('url')->defaults(['company_id' => company_id()]);  // 确保 URL 生成正确
+    $message = (new MailMessage)
+        ->from(config('mail.from.address'), config('mail.from.name'))  // 已恢复的邮件配置
+        // ...
+}
+```
+
+### 6.4 模块注册在异步任务中的影响
+
+#### 6.4.1 为什么需要 registerModules()
+
+`registerModules()` 定义在 `app/Traits/Modules.php` 中，实质调用 `ModuleActivator::register()`。它负责：
+
+1. **加载模块的 ServiceProvider**：`register()` 和 `boot()` 方法
+2. **注册模块的事件监听器**：如 `DocumentCreated`、`TransactionCreated` 等业务事件
+3. **注册模块的路由**：包括 API、Admin、Portal 路由
+4. **注册模块的视图命名空间**：`view('module-alias::...')`
+5. **注册模块的翻译文件**：`trans('module-alias::...')`
+6. **挂载模块的菜单监听器**：`AdminCreating`、`SettingsCreated` 等
+
+#### 6.4.2 在异步任务中的执行条件
+
+```php
+// JobProcessing 中：
+if (should_queue()) {
+    $this->registerModules();
+}
+```
+
+`should_queue()` 判断 `QUEUE_CONNECTION !== 'sync'`。这意味着：
+
+| 场景 | 是否执行 registerModules | 原因 |
+|------|------------------------|------|
+| `QUEUE_CONNECTION=database` + Worker | ✅ 是 | `should_queue()` = true |
+| `QUEUE_CONNECTION=redis` + Horizon | ✅ 是 | `should_queue()` = true |
+| `QUEUE_CONNECTION=sync` + dispatchSync | ❌ 否 | 同步模式下仍在 HTTP 请求生命周期内，模块已由 IdentifyCompany 加载 |
+| Artisan 命令内手动 dispatch | 视 `QUEUE_CONNECTION` 而定 | 如用 database/redis 则会执行 |
+
+#### 6.4.3 模块注册失败导致的业务影响
+
+如果异步任务中**跳过**了 `registerModules()`，会导致：
+
+1. **事件监听器缺失**：例如某支付模块监听 `DocumentCreated` 事件来自动创建支付记录 — 在异步生成重复发票（`recurring:check` 中 `DocumentRecurring` 事件）时不会触发
+2. **翻译字符串回退**：`trans('module-alias::invoice.subject')` 无法加载，直接返回 key 字符串
+3. **视图找不到**：邮件模板中 `view('module-alias::pdf.invoice')` 抛出 `InvalidArgumentException`
+4. **自定义 Eloquent 方法缺失**：模块通过 `Builder::macro()` 注册的查询方法无法调用
+5. **任务调度丢失**：模块在 `boot()` 中动态注册的 Cron 调度不会生效
+
+### 6.5 定时任务中的典型模式
+
+三个定时任务（`app/Console/Commands/RecurringCheck.php`、`app/Console/Commands/InvoiceReminder.php`、`app/Console/Commands/BillReminder.php`）均遵循"遍历所有公司 → 切换上下文 → 处理 → 清理"模式：
 
 **标准流程模板**：
 
@@ -384,11 +640,11 @@ public function handle()
 }
 ```
 
-### 6.3 各定时任务的上下文管理分析
+### 6.6 各定时任务的上下文管理分析
 
-#### 6.3.1 `recurring:check` — 重复账单检查
+#### 6.6.1 `recurring:check` — 重复账单检查
 
-[RecurringCheck.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Console/Commands/RecurringCheck.php#L40-L162)：
+`app/Console/Commands/RecurringCheck.php`：
 
 | 行号 | 操作 | 说明 |
 |------|------|------|
@@ -397,12 +653,14 @@ public function handle()
 | L77-L89 | 检查公司是否启用 | 禁用公司超3个月无活跃则删除重复模板 |
 | L92-L112 | 检查是否有活跃用户 | 3个月无登录用户则跳过并清理 |
 | L114 | `company($recur->company_id)->makeCurrent()` | **切换上下文** |
-| L127-L153 | 执行重复账单生成 | 此期间所有查询均带该公司过滤 |
+| L127-L153 | 执行重复账单生成 | 此期间所有查询均带该公司过滤；`DocumentCreated`、`DocumentRecurring` 事件被触发，**需确保模块已加载** |
 | L156 | `Company::forgetCurrent()` | 循环后清理 |
 
-#### 6.3.2 `reminder:invoice` / `reminder:bill` — 催款提醒
+**注意**：`RecurringCheck` 是 Artisan 命令，不经过 Queue 的 `JobProcessing` 钩子，因此 `registerModules()` **未自动调用**。如果重复账单生成依赖模块的事件监听器（如电子发票模块需要在 `DocumentCreated` 时生成 XML），需要在该命令中显式调用。
 
-[InvoiceReminder.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Console/Commands/InvoiceReminder.php#L34-L77)：
+#### 6.6.2 `reminder:invoice` / `reminder:bill` — 催款提醒
+
+`app/Console/Commands/InvoiceReminder.php`：
 
 ```php
 foreach ($companies as $company) {
@@ -419,7 +677,9 @@ foreach ($companies as $company) {
 Company::forgetCurrent();
 ```
 
-### 6.4 上下文切换在 Cron Job 中的连锁效应
+在 `remind()` 方法内部通过 `event(new DocumentReminded($invoice, Notification::class))` 触发通知发送，`Notification` 类如果走异步队列会再次经过 `createPayloadUsing` + `JobProcessing` 的完整上下文传递链。
+
+### 6.7 上下文切换在后台任务中的连锁效应汇总
 
 | 影响维度 | 具体表现 |
 |---------|---------|
@@ -428,24 +688,14 @@ Company::forgetCurrent();
 | **时区** | `Overrider::load('settings')` 会覆盖 `config('app.timezone')`，`Date::now()` 随之变化 |
 | **邮件配置** | `mail.from`、SMTP 服务器等均为该公司配置，发送邮件时自动使用 |
 | **货币** | `Money::setLocale()`、`default_currency()` 等基于该公司设置 |
-| **事件/监听器** | `registerModules()` 加载的模块监听器会参与处理（如 DocumentCreated 监听器） |
+| **事件/监听器** | `registerModules()` 加载的模块监听器会参与处理（队列 JobProcessing 中自动执行，Artisan 命令需手动） |
 | **文件路径** | 文件上传 URL 配置 `filesystems.disks.*.url` 自动拼接 `/{company_id}/uploads` |
+| **缓存命名空间** | `cache_prefix()` = `{company_id}_`，避免跨公司缓存污染 |
+| **搜索字符串配置** | `categoryTypes` 已被 `loadCategoryTypes()` 重写为公司自定义分类类型 |
 
-### 6.5 队列 Job 中的特殊注意
+### 6.8 Schedule 调度器注册
 
-队列 Job 同样不经过 HTTP 中间件，但如果是从 Web 请求中派发的，需要注意：
-
-1. **同步派发 (`dispatchSync`)**：继承当前请求的公司上下文，无需额外处理
-2. **异步派发 (`dispatchQueue`)**：Worker 进程中上下文为空，必须：
-   - 在 Job 类中保存 `company_id` 到属性
-   - 在 `handle()` 方法开头调用 `company($this->company_id)->makeCurrent()`
-   - 处理完成后调用 `Company::forgetCurrent()`（特别是 Worker 进程常驻场景）
-
-[Abstracts/Job.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Abstracts/Job.php) 基类中未内置上下文管理，各 Job 需自行实现。
-
-### 6.6 Schedule 调度器注册
-
-[Console/Kernel.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Console/Kernel.php#L23-L37)：
+`app/Console/Kernel.php`：
 
 ```php
 protected function schedule(Schedule $schedule)
@@ -468,7 +718,7 @@ protected function schedule(Schedule $schedule)
 
 ## 七、Overrider：公司级配置覆盖
 
-[Overrider.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Utilities/Overrider.php) 在 `makeCurrent()` 中被调用三次，将公司设置同步到 Laravel Config：
+`app/Utilities/Overrider.php` 在 `makeCurrent()` 中被调用三次，将公司设置同步到 Laravel Config：
 
 ### 7.1 `loadSettings()` — 基础配置覆盖
 
@@ -498,25 +748,35 @@ protected function schedule(Schedule $schedule)
 
 | 功能模块 | 文件路径 |
 |---------|---------|
-| 公司识别中间件 | [IdentifyCompany.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Http/Middleware/IdentifyCompany.php) |
-| Company ID 解析 Trait | [Companies.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Traits/Companies.php) |
-| Company 模型（上下文管理） | [Company.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Models/Common/Company.php) |
-| 全局辅助函数 | [helpers.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Utilities/helpers.php) |
-| 中间件注册 | [Kernel.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Http/Kernel.php) |
-| 路由分组与前缀 | [Route.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Providers/Route.php) |
-| Eloquent 全局 Scope | [Company.php (Scope)](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Scopes/Company.php) |
-| 租户 Trait | [Tenants.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Traits/Tenants.php) |
-| Model 基类 | [Model.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Abstracts/Model.php) |
-| 配置覆盖器 | [Overrider.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Utilities/Overrider.php) |
-| 公司切换控制器 | [Companies.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Http/Controllers/Common/Companies.php) |
-| 用户-公司关系校验 | [Users.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Traits/Users.php) |
-| Admin 菜单构建 | [AdminMenu.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Http/Middleware/AdminMenu.php) |
-| Admin 默认菜单项 | [ShowInAdmin.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Listeners/Menu/ShowInAdmin.php) |
-| 定时任务调度 | [Console/Kernel.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Console/Kernel.php) |
-| 重复账单任务 | [RecurringCheck.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Console/Commands/RecurringCheck.php) |
-| 发票催款任务 | [InvoiceReminder.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Console/Commands/InvoiceReminder.php) |
-| 账单催款任务 | [BillReminder.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Console/Commands/BillReminder.php) |
-| 登出清理 | [Logout.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Listeners/Auth/Logout.php) |
-| 事件-监听器映射 | [Event.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Providers/Event.php) |
-| Job 基类 | [Job.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Abstracts/Job.php) |
-| Job Trait（派发） | [Jobs.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Traits/Jobs.php) |
+| **队列上下文自动管理（核心）** | `app/Providers/Queue.php` |
+| 公司识别中间件 | `app/Http/Middleware/IdentifyCompany.php` |
+| Company ID 解析 Trait | `app/Traits/Companies.php` |
+| Company 模型（上下文管理） | `app/Models/Common/Company.php` |
+| 全局辅助函数（company / company_id） | `app/Utilities/helpers.php` |
+| HTTP 中间件注册 | `app/Http/Kernel.php` |
+| 路由分组与前缀宏 | `app/Providers/Route.php` |
+| Eloquent 全局 Scope | `app/Scopes/Company.php` |
+| 租户 Trait（boot 时注册 Scope） | `app/Traits/Tenants.php` |
+| Model 基类（默认启用 Tenants） | `app/Abstracts/Model.php` |
+| 异步 Job 基类（SerializesModels） | `app/Abstracts/JobShouldQueue.php` |
+| 同步 Job 基类 | `app/Abstracts/Job.php` |
+| Job 派发 Trait（dispatch / dispatchSync） | `app/Traits/Jobs.php` |
+| Notification 基类（ShouldQueue） | `app/Abstracts/Notification.php` |
+| 队列请求集合（替代不可序列化的 Request） | `app/Utilities/QueueCollection.php` |
+| 配置覆盖器（设置/货币/分类） | `app/Utilities/Overrider.php` |
+| 公司切换控制器 | `app/Http/Controllers/Common/Companies.php` |
+| 用户-公司关系校验 Trait | `app/Traits/Users.php` |
+| 模块注册 Trait | `app/Traits/Modules.php` |
+| Admin 菜单构建中间件 | `app/Http/Middleware/AdminMenu.php` |
+| Portal 菜单构建中间件 | `app/Http/Middleware/PortalMenu.php` |
+| Admin 默认菜单项监听器 | `app/Listeners/Menu/ShowInAdmin.php` |
+| Artisan 调度注册 | `app/Console/Kernel.php` |
+| 队列连接配置 | `config/queue.php` |
+| 重复账单 Cron 任务（遍历模式） | `app/Console/Commands/RecurringCheck.php` |
+| 发票催款 Cron 任务（遍历模式） | `app/Console/Commands/InvoiceReminder.php` |
+| 账单催款 Cron 任务（遍历模式） | `app/Console/Commands/BillReminder.php` |
+| 安装模块 Job（显式 company_id 属性） | `app/Jobs/Install/EnableModule.php` |
+| 发票 Notification（关联隐式获取） | `app/Notifications/Sale/Invoice.php` |
+| 批量下载 Job（company_id() 直接使用） | `app/Jobs/Common/CreateZipForDownload.php` |
+| 登出清理 session | `app/Listeners/Auth/Logout.php` |
+| 事件-监听器映射表 | `app/Providers/Event.php` |

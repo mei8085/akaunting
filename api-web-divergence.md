@@ -994,32 +994,17 @@ Model->toArray() = 数据库字段（经字段访问器转换）
   "data": [
     { "...": "Resource 转换后的字段" }
   ],
-  "links": {
-    "first": "...",
-    "last": "...",
-    "prev": null,
-    "next": "..."
-  },
-  "meta": {
-    "current_page": 1,
-    "from": 1,
-    "last_page": 5,
-    "path": "...",
-    "per_page": 25,
-    "to": 25,
-    "total": 109
-  }
+  "links": { "first": "...", "last": "...", "prev": null, "next": "..." },
+  "meta": { "current_page": 1, "from": 1, "last_page": 5, "per_page": 25, "to": 25, "total": 109 }
 }
 ```
 
-**Web 出口（JSON 模式，通用包装）**：
+**Web 出口（通用包装模式）**：
 ```json
 {
   "success": true,
   "error": false,
-  "data": [
-    { "...": "Model 序列化结果（数据库字段 + $appends）" }
-  ],
+  "data": [ /* Model->toArray()：数据库字段 + $appends - $hidden */ ],
   "message": ""
 }
 ```
@@ -1028,50 +1013,161 @@ Model->toArray() = 数据库字段（经字段访问器转换）
 
 **API 出口**：
 ```json
-{
-  "data": {
-    "id": 1,
-    "...": "Resource 转换后的单个对象"
-  }
-}
+{ "data": { "id": 1, "...": "Resource 转换后的单个对象" } }
 ```
 
-**Web 出口（JSON 模式，通用包装）**：
+**Web 出口（通用包装模式）**：
 ```json
-{
-  "success": true,
-  "error": false,
-  "data": {
-    "id": 1,
-    "...": "Model 序列化完整数据"
-  },
-  "message": ""
-}
+{ "success": true, "error": false, "data": { "id": 1, "...": "Model->toArray()" }, "message": "" }
 ```
 
-### 6.3 写操作（store/update/enable/disable）响应结构
+### 6.3 创建/更新操作（store/update/enable/disable）响应结构
 
 **API 出口**：
-- `store`：201 状态码 + `Location` header + Resource 数据
-- `update`：200 + Resource 数据
-- `enable/disable`：200 + Resource 数据
-- `destroy`：204 No Content（无响应体）
+- `store`：201 + `Location` header + `{ "data": { /* Resource 转换 */ } }`
+- `update`：200 + `{ "data": { /* Resource 转换 */ } }`
+- `enable/disable`：200 + `{ "data": { /* Resource 转换 */ } }`
 
-**Web 出口（直接返回模式）**：
+**Web 出口（直接返回模式，data = Model 序列化）**：
 ```json
 {
   "success": true,
   "error": false,
-  "data": {
-    "id": 1,
-    "...": "Model 序列化完整数据（$appends 中的虚拟访问器也包含）"
-  },
-  "message": "操作成功提示",
+  "data": { "id": 1, "...": "完整 Model->toArray()（含 $appends - $hidden）" },
+  "message": "",
   "redirect": "/common/items"
 }
 ```
-- **注意**：`data` 字段**保留**，内容是 job 返回的 Model 序列化结果
-- 失败时：`{success: false, error: true, data: null, code: xxx, message: "错误信息", redirect: "..."}`
+- `data` 是 Job 返回的 Model 对象经 `response()->json()` 自动调用 `toArray()` 的结果
+- Controller 可在 `ajaxDispatch` 之后、`response()->json()` 之前访问 `$response['data']->id` 等 Model 属性
+
+**失败时**（异常被 `ajaxDispatch` 捕获）：
+```json
+{
+  "success": false,
+  "error": true,
+  "data": null,
+  "code": 500,
+  "message": "错误信息",
+  "redirect": "/common/items/create"
+}
+```
+
+### 6.4 删除操作（destroy）响应结构
+
+**API 出口**：
+- `destroy`：204 No Content（无响应体）
+
+**Web 出口（直接返回模式，data = 布尔值 true）**：
+```json
+{
+  "success": true,
+  "error": false,
+  "data": true,
+  "message": "",
+  "redirect": "/common/items"
+}
+```
+- **⚠️ 关键差异**：`data` 是 `true`，不是被删除的 Model 数据
+- 原因：`DeleteItem::handle()` 返回 `bool true`（Model 已从数据库删除，不可再序列化）
+- 前端不可用 `data.id` 或 `data.name` 等属性
+
+**失败时**（如删除失败）：
+```json
+{
+  "success": false,
+  "error": true,
+  "data": null,
+  "code": 403,
+  "message": "无权限删除",
+  "redirect": "/common/items"
+}
+```
+
+### 6.5 弹窗展示（Modal create/edit）响应结构
+
+**Web 出口（特殊接口模式，data = 手动数组或不存在）**：
+
+**有 data 的弹窗**（如 `DocumentTransactions::create`）：
+```json
+{
+  "success": true,
+  "error": false,
+  "message": "null",
+  "html": "<div>表单 HTML</div>",
+  "data": { "title": "New Payment", "buttons": { "cancel": {...}, "confirm": {...} } }
+}
+```
+- `data` 是 UI 控制数据（标题、按钮），不是 Model 序列化
+
+**无 data 的弹窗**（如 `Modals\Items::create`）：
+```json
+{
+  "success": true,
+  "error": false,
+  "message": "null",
+  "html": "<div>表单 HTML</div>"
+}
+```
+- 没有 `data` 字段
+
+### 6.6 弹窗保存（Modal store）响应结构
+
+**Web 出口（直接返回模式，与普通 store 相同）**：
+```json
+{
+  "success": true,
+  "error": false,
+  "data": { "id": 1, "...": "完整 Model->toArray()" },
+  "message": "创建成功",
+  "redirect": "/sales/invoices/1"
+}
+```
+- `data` 来源与普通写操作完全一致：`ajaxDispatch` → Job 返回 Model → `toArray()`
+
+### 6.7 手动对象接口（config 等）响应结构
+
+**Web 出口（特殊接口模式，无标准包装）**：
+
+**config 接口**（如 `Currencies::config`）：
+```json
+{
+  "name": "US Dollar",
+  "code": "USD",
+  "rate": 1,
+  "symbol": "$"
+}
+```
+- 无 `{success, error, data}` 包装
+- 数据来自外部库 `currency()`，不是 Currency Model 序列化
+
+**手动 null 接口**（如 `Portal\Profile::update`）：
+```json
+{
+  "success": true,
+  "error": false,
+  "data": null,
+  "message": "",
+  "redirect": "/portal/profile/1/edit"
+}
+```
+- `data` 显式为 `null`，不返回数据实体
+
+### 6.8 响应结构速查总表
+
+| 操作 | API 响应 | Web 响应 data 类型 | Web 响应包装 |
+|------|---------|-------------------|-------------|
+| 列表 index | `{data, links, meta}` | `Model[]->toArray()` | `{success, error, data, message}` |
+| 单条 show | `{data}` | `Model->toArray()` | `{success, error, data, message}` |
+| 创建 store | 201 + `{data}` | `Model->toArray()` | `{success, error, data, message, redirect}` |
+| 更新 update | `{data}` | `Model->toArray()` | `{success, error, data, message, redirect}` |
+| 启/禁用 | `{data}` | `Model->toArray()` | `{success, error, data, message, redirect}` |
+| **删除 destroy** | **204 无响应体** | **`bool true`** | `{success, error, data, message, redirect}` |
+| 弹窗展示 | — | 手动数组 或 不存在 | `{success, error, message, html, data?}` |
+| 弹窗保存 | — | `Model->toArray()` | `{success, error, data, message, redirect?}` |
+| config | — | `stdClass`（外部库） | 无包装，直接输出 |
+| Profile 更新 | — | `null` | `{success, error, data:null, message, redirect}` |
+| API Key 保存 | — | 不存在 | `{success, error, redirect, message}` |
 
 ---
 

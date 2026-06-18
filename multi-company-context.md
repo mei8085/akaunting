@@ -1125,6 +1125,342 @@ public function map($row): array
 
 ---
 
+## 7.6 通知包装任务与普通队列任务的序列化差异深度分析
+
+### 7.6.1 通知队列的双重包装机制
+
+**关键机制**：通知对象本身**不会直接被序列化入队**。Laravel 会创建一个 `SendQueuedNotifications` 包装器对象，将通知、接收者、通道打包后入队。
+
+```
+用户代码：
+$user->notify(new Invoice($invoice, 'invoice_new_customer'));
+    ↓
+Laravel 内部包装：
+new SendQueuedNotifications(
+    $notifiables = [$user],       // 接收者集合（User 模型）
+    $notification = new Invoice,  // 通知对象本身
+    $channels = ['mail', 'database']
+)
+    ↓
+SendQueuedNotifications 使用 SerializesModels trait
+    ↓
+序列化入队
+```
+
+### 7.6.2 SendQueuedNotifications 类结构（Laravel 框架内部）
+
+```php
+// vendor/laravel/framework/src/Illuminate/Notifications/SendQueuedNotifications.php
+class SendQueuedNotifications implements ShouldQueue
+{
+    use InteractsWithQueue, Queueable, SerializesModels;  // ⚠️ 关键：使用了 SerializesModels！
+
+    /** @var Collection 通知接收者集合 */
+    public $notifiables;
+
+    /** @var Notification 实际通知对象 */
+    public $notification;
+
+    /** @var array 通知通道 */
+    public $channels;
+
+    public $tries;
+    public $timeout;
+    public $shouldBeEncrypted;
+}
+```
+
+**序列化影响分析**：
+
+| 属性 | 类型 | SerializesModels 处理方式 | 公司隔离风险 |
+|------|------|--------------------------|-------------|
+| `$notifiables` | Collection\<User> | ✅ 仅存模型 ID，反序列化时重新查询 | ⚠️ **高风险**：newQueryWithoutScopes() 跳过 Company Scope |
+| `$notification` | Notification 对象 | ❌ 不是 Eloquent 模型，PHP 原生 serialize 完整序列化 | 取决于通知内部属性 |
+| `$channels` | array | 直接序列化 | 无风险 |
+
+### 7.6.3 与普通队列任务（JobShouldQueue）的核心差异对比
+
+| 对比维度 | 普通异步 Job<br>(`JobShouldQueue`) | 通知队列任务<br>(`SendQueuedNotifications` 包装器) |
+|---------|----------------------------------|------------------------------------------------|
+| **序列化 Trait 位置** | Job 类本身使用 `SerializesModels` | 包装器 `SendQueuedNotifications` 使用<br>通知类本身**不使用** |
+| **模型属性处理** | Job 的所有 Eloquent 属性 → 仅存 ID | 分两层处理：<br>1. `$notifiables`（User 模型）→ 仅存 ID（⚠️ 跳过 Scope）<br>2. 通知对象内部的模型 → **完整序列化**（PHP 原生） |
+| **反序列化查询数** | 每个模型属性一次查询 | 1 次查询（仅 `$notifiables`）<br>通知内部模型不查询 |
+| **通知对象模型风险** | 不涉及 | 通知内部模型被完整序列化，payload 篡改需修改 PHP 序列化字符串（难度高） |
+| **反序列化跳过 Scope** | ✅ 所有模型属性都跳过 | ⚠️ **仅 `$notifiables`（接收者）跳过**<br>通知内部模型不查询数据库，不涉及 Scope |
+| **payload 篡改难度** | 低（改模型 ID 即可） | 中等：<br>- 改 `$notifiables` 的 ID：容易<br>- 改通知内部模型：需篡改 PHP 序列化结构 |
+| **典型风险场景** | 业务逻辑处理跨公司数据 | 1. 向跨公司用户发送通知（收件人越权）<br>2. 通知内容上下文错配 |
+
+### 7.6.4 序列化结构对比图
+
+**普通 Job（JobShouldQueue）序列化结构**：
+```
+UpdateItem Job 对象（SerializesModels）
+├─ $model → ModelIdentifier(class: Item, id: 123)  ← ⚠️ 仅存 ID
+├─ $request → QueueCollection(...)                  ← 普通数据，完整序列化
+└─ ...
+反序列化时：
+  $model = Item::newQueryWithoutScopes()->find(123)  ← ⚠️ 跳过 Company Scope
+```
+
+**通知队列（SendQueuedNotifications）序列化结构**：
+```
+SendQueuedNotifications（SerializesModels）
+├─ $notifiables → [ModelIdentifier(class: User, id: 456)]  ← ⚠️ 仅存 ID
+├─ $notification → Invoice 对象（PHP 原生 serialize 完整序列化）
+│   ├─ $invoice → Document 对象完整属性
+│   │   ├─ id: 789
+│   │   ├─ company_id: 1
+│   │   ├─ document_number: "INV-2025-001"
+│   │   ├─ amount: 1000.00
+│   │   └─ ...（所有属性完整保留）
+│   ├─ $template → EmailTemplate 对象完整属性
+│   ├─ $attach_pdf: true
+│   └─ ...
+└─ $channels: ['mail', 'database']
+反序列化时：
+  $notifiables = User::newQueryWithoutScopes()->find(456)  ← ⚠️ 跳过 Company Scope
+  $notification = unserialize(...)  ← PHP 原生反序列化，不查询数据库，$invoice 属性直接恢复
+```
+
+---
+
+## 7.7 发票通知的公司隔离风险详细评估
+
+### 7.7.1 发票通知（Invoice）属性清单
+
+| 属性 | 类型 | 序列化方式 | 风险等级 |
+|------|------|-----------|----------|
+| `$invoice` | Document 模型 | PHP 原生完整序列化 | ✅ 低（不查询数据库） |
+| `$template` | EmailTemplate 模型 | PHP 原生完整序列化 | ✅ 低（不查询数据库） |
+| `$attach_pdf` | bool | 直接序列化 | ✅ 无风险 |
+| `$attachments` | array | 直接序列化 | ✅ 无风险 |
+| `$custom_mail` | array | 直接序列化 | ⚠️ 中（可能包含收件人地址） |
+| `$notifiables`（包装器） | Collection\<User> | SerializesModels → 仅存 ID | ⚠️ **高（跳过 Scope）** |
+
+### 7.7.2 发票通知执行流程中的风险点
+
+**代码路径**：[Invoice.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Notifications/Sale/Invoice.php)
+
+#### 风险点 1：`$notifiable`（接收者）跨公司
+
+```php
+// SendQueuedNotifications 反序列化时，$notifiables 跳过 Scope
+$user = User::newQueryWithoutScopes()->find($tampered_user_id);
+    ↓
+// 现在 $user 可能是其他公司的用户
+public function toMail($notifiable): MailMessage
+{
+    if (!empty($this->custom_mail['to'])) {
+        $notifiable->email = $this->custom_mail['to'];  // ⚠️ 可能覆盖为任意邮箱
+    }
+    // 邮件发给 $notifiable->email
+}
+```
+
+**攻击场景**：
+1. 攻击者篡改 `jobs` 表 payload，将 `$notifiables` 中的 user_id 改为其他公司管理员的 ID
+2. 反序列化时跳过 Scope，成功加载该管理员用户
+3. 邮件发送给了其他公司的管理员，泄露本公司的发票数据
+
+#### 风险点 2：`$invoice` 属性泄露（上下文错配）
+
+```php
+// getTagsReplacement() 中的关联查询
+public function getTagsReplacement(): array
+{
+    return [
+        // ...
+        $this->invoice->document_number,  // ✅ 序列化时已保存，安全（但可能与上下文错配）
+        // ...
+        $this->invoice->company->name,      // ⚠️ 关联查询，受 Scope 保护
+        $this->invoice->company->email,     // ⚠️ 关联查询，受 Scope 保护
+        // ...
+    ];
+}
+```
+
+**详细分析**：
+
+| 数据来源 | 访问方式 | Company Scope 生效？ | 跨公司泄露风险 |
+|---------|---------|---------------------|---------------|
+| 发票号 `document_number` | `$this->invoice->document_number` | ❌ 不查询，从序列化属性读取 | ⚠️ 中：如果 payload 被篡改，需要修改 PHP 序列化字符串中的属性值 |
+| 发票金额 `amount` | `$this->invoice->amount` | ❌ 不查询，从序列化属性读取 | 同上 |
+| 客户名 `contact_name` | `$this->invoice->contact_name` | ❌ 不查询，从序列化属性读取 | 同上 |
+| 公司名 `company->name` | `$this->invoice->company->name` | ✅ 关联查询新触发，Scope 生效 | ✅ 低：跨公司时 WHERE company_id = 上下文ID，关联返回 null，模板报错但不泄露 |
+| 公司邮箱 `company->email` | `$this->invoice->company->email` | ✅ 同上 | ✅ 低 |
+| PDF 附件 | `storeDocumentPdfAndGetPath($this->invoice)` | ✅ 内部使用 ID 查询，Scope 生效 | ⚠️ 中：如果 $invoice->id 与上下文 company_id 不匹配，查询返回 null，PDF 生成失败但不会泄露 |
+
+#### 风险点 3：邮件发件人身份伪造
+
+```php
+// initMailMessage() in [Notification.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Abstracts/Notification.php)
+public function initMailMessage(): MailMessage
+{
+    app('url')->defaults(['company_id' => company_id()]);  // ⚠️ 依赖上下文
+
+    $message = (new MailMessage)
+        ->from(config('mail.from.address'), config('mail.from.name'))  // ⚠️ 依赖上下文设置
+        ->subject($this->getSubject())
+        ->view('components.email.body', ['body' => $this->getBody()]);
+    // ...
+}
+```
+
+**风险**：如果 `payload.company_id` 被篡改，`makeCurrent()` 恢复到错误公司：
+- `config('mail.from.name')` = 被篡改公司的名称
+- `config('mail.from.address')` = 被篡改公司的邮箱
+- 邮件以错误公司的名义发出，可能用于钓鱼攻击
+
+### 7.7.3 发票通知风险总结矩阵
+
+| 攻击向量 | 可行性 | 影响程度 | 综合风险 | 说明 |
+|---------|--------|---------|---------|------|
+| 接收者越权（改 $notifiables ID） | 高 | 高 | 🔴 **严重** | 只需改 user_id，邮件发给跨公司用户，泄露完整发票内容 |
+| 发件人伪造（改 company_id） | 中 | 中 | 🟠 **高** | 钓鱼攻击风险，需同时伪造 company_id 和通知内容 |
+| 发票内容篡改（改序列化属性） | 低 | 中 | 🟡 **中** | 需理解 PHP 序列化格式并修改属性值 |
+| $invoice->company 关联泄露 | 低 | 低 | 🟢 **低** | Scope 保护，跨公司时返回 null，模板报错 |
+| PDF 附件泄露 | 低 | 中 | 🟡 **中** | 使用 $invoice->id 查询，受 Scope 保护，跨公司时返回 null |
+
+---
+
+## 7.8 导入导出通知的公司隔离风险详细评估
+
+### 7.8.1 导入导出通知类属性清单
+
+#### 导出完成通知（ExportCompleted）
+
+**代码路径**：[ExportCompleted.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Notifications/Common/ExportCompleted.php)
+
+| 属性 | 类型 | 序列化方式 | 风险等级 |
+|------|------|-----------|----------|
+| `$translation` | string（导出类型翻译） | 直接序列化 | ✅ 无风险 |
+| `$file_name` | string（文件名） | 直接序列化 | ✅ 无风险 |
+| `$download_url` | string（下载 URL） | 直接序列化 | ⚠️ 中（URL 完整性依赖派发时） |
+| `$notifiables`（包装器） | Collection\<User> | SerializesModels → 仅存 ID | ⚠️ **高（跳过 Scope）** |
+
+**关键特征**：
+- ❌ 不包含任何 Eloquent 模型属性
+- ❌ 不继承 Akaunting 的 `Notification` 基类，直接继承 Laravel 的 `Notification`
+- ✅ 所有属性都是简单的字符串类型
+
+#### 导入完成通知（ImportCompleted）
+
+**代码路径**：[ImportCompleted.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Notifications/Common/ImportCompleted.php)
+
+| 属性 | 类型 | 序列化方式 | 风险等级 |
+|------|------|-----------|----------|
+| `$translation` | string（导入类型翻译） | 直接序列化 | ✅ 无风险 |
+| `$total_rows` | int（导入行数） | 直接序列化 | ✅ 无风险 |
+| `$notifiables`（包装器） | Collection\<User> | SerializesModels → 仅存 ID | ⚠️ **高（跳过 Scope）** |
+
+**关键特征**：
+- ❌ 不包含任何 Eloquent 模型属性
+- ❌ 不继承 Akaunting 的 `Notification` 基类
+- ✅ 所有属性都是简单类型
+
+#### 导出失败通知（ExportFailed）
+
+| 属性 | 类型 | 风险等级 |
+|------|------|---------|
+| `$message` | string（错误消息） | ✅ 无风险 |
+
+#### 导入失败通知（ImportFailed）
+
+| 属性 | 类型 | 风险等级 |
+|------|------|---------|
+| `$errors` | array（错误列表） | ✅ 无风险 |
+
+### 7.8.2 导入导出通知执行流程中的风险点
+
+#### 风险点 1：下载 URL 安全分析
+
+```php
+// ExportCompleted::toMail()
+public function toMail($notifiable): MailMessage
+{
+    return (new MailMessage)
+        ->from(config('mail.from.address'), config('mail.from.name'))  // ⚠️ 上下文依赖
+        ->subject(trans('notifications.export.completed.title'))
+        ->action(trans('general.download'), $this->download_url);      // URL 直接渲染
+}
+```
+
+**$download_url 安全分析**：
+
+| 场景 | 风险 | 防护 |
+|------|------|------|
+| URL 生成时上下文正确 | ✅ 安全 | 派发时使用正确的 `company_id()` 生成签名 URL |
+| URL 生成时上下文错误 | ⚠️ 中 | URL 包含错误公司的 `company_id`，但签名通常验证通过 |
+| 篡改 payload 中的 URL | 低 | 需修改 PHP 序列化字符串，难度高；即使修改成功，`signedRoute` 签名会失效 |
+| 下载时二次校验 | ✅ 强 | 下载控制器通常会再次验证 `company_id` 和用户权限 |
+
+#### 风险点 2：导入完成时的上下文依赖
+
+```php
+// ImportCompleted::toMail()
+public function toMail($notifiable): MailMessage
+{
+    $dashboard_url = route('dashboard', ['company_id' => company_id()]);  // ⚠️ 依赖上下文
+
+    return (new MailMessage)
+        ->from(config('mail.from.address'), config('mail.from.name'))  // ⚠️ 上下文依赖
+        ->action(trans_choice('general.dashboards', 1), $dashboard_url);
+}
+```
+
+**风险**：如果 `payload.company_id` 被篡改：
+1. `$dashboard_url` 包含错误的 `company_id`
+2. `config('mail.from')` = 被篡改公司的发件人信息
+3. 用户点击链接时，由于不属于该公司，访问被拒绝（但产生迷惑）
+
+#### 风险点 3：接收者越权（$notifiables 跳过 Scope）
+
+这是所有通知的**通用高风险点**，导入导出通知也不例外：
+
+```php
+// 攻击者篡改 jobs 表，将 notifiables.user_id 改为其他公司用户 ID
+// SendQueuedNotifications 反序列化：
+$victim_user = User::newQueryWithoutScopes()->find(999);  // ⚠️ 加载其他公司用户
+    ↓
+// 导出完成邮件发送给了 $victim_user
+// 邮件内容包含：下载链接 + 导出文件信息
+```
+
+**攻击影响**：
+- **导出完成通知**：受害者收到包含下载链接的邮件。如果导出文件包含敏感数据（如财务报表），可能泄露。但下载链接通常有签名验证，且受害者点击时会被权限系统拦截。
+- **导入完成通知**：受害者收到导入成功通知邮件，包含导入行数等信息，风险较低（无直接数据泄露）。
+- **失败通知**：受害者收到错误消息，风险极低（无敏感数据）。
+
+### 7.8.3 导入导出通知与发票通知风险对比
+
+| 对比维度 | 发票通知（Invoice） | 导入导出通知（Export/Import） |
+|---------|-------------------|----------------------------|
+| **内部模型属性** | ✅ 有（$invoice, $template） | ❌ 无 |
+| **模型属性序列化方式** | PHP 原生完整序列化 | 不涉及 |
+| **payload 篡改模型属性难度** | 高（需改序列化格式） | 不涉及 |
+| **直接数据泄露风险** | 中（发票号、金额、客户名） | 低（仅字符串，无敏感业务数据） |
+| **接收者越权风险** | 🔴 高（泄露完整发票） | 🟠 中（仅下载链接/状态信息） |
+| **关联查询风险** | 中（$invoice->company） | 低（无关联查询） |
+| **发件人伪造风险** | 🔴 高（以错误公司名义发发票） | 🟡 中（以错误公司名义发通知） |
+| **PDF 附件风险** | 中（可能泄露发票 PDF） | 不涉及 |
+| **综合风险等级** | 🔴 **高** | 🟠 **中** |
+
+### 7.8.4 导入导出通知风险总结
+
+**优点（相对安全）**：
+1. ✅ 无内部 Eloquent 模型属性，不存在模型反序列化问题
+2. ✅ 所有属性为简单类型，payload 篡改难度较高（需修改 PHP 序列化格式）
+3. ✅ 下载 URL 通常使用 `signedRoute`，篡改后签名失效
+4. ✅ 下载时控制器会再次校验公司和用户权限
+
+**缺点（仍存在风险）**：
+1. ⚠️ **接收者越权风险**：`$notifiables` 反序列化跳过 Company Scope，可向跨公司用户发送通知
+2. ⚠️ **上下文依赖**：`config('mail.from')`、`company_id()`、`route()` 依赖上下文正确恢复
+3. ⚠️ **发件人伪造**：可通过篡改 `company_id` 以其他公司名义发送邮件
+4. ⚠️ **下载链接暴露**：虽然有签名保护，但如果签名验证配置不当，仍可能被跨公司访问
+
+---
+
 ## 八、Overrider：公司级配置覆盖
 
 `app/Utilities/Overrider.php` 在 `makeCurrent()` 中被调用三次，将公司设置同步到 Laravel Config：
@@ -1171,7 +1507,8 @@ public function map($row): array
 | 异步 Job 基类（SerializesModels） | `app/Abstracts/JobShouldQueue.php` |
 | 同步 Job 基类 | `app/Abstracts/Job.php` |
 | Job 派发 Trait（dispatch / dispatchSync） | `app/Traits/Jobs.php` |
-| Notification 基类（ShouldQueue） | `app/Abstracts/Notification.php` |
+| Notification 基类（ShouldQueue，无 SerializesModels） | `app/Abstracts/Notification.php` |
+| Event 基类（SerializesModels） | `app/Abstracts/Event.php` |
 | Export 抽象类（ShouldQueue + Exportable） | `app/Abstracts/Export.php` |
 | Import 抽象类（ShouldQueue + Importable） | `app/Abstracts/Import.php` |
 | 队列请求集合（替代不可序列化的 Request） | `app/Utilities/QueueCollection.php` |
@@ -1188,10 +1525,12 @@ public function map($row): array
 | 发票催款 Cron 任务（遍历模式） | `app/Console/Commands/InvoiceReminder.php` |
 | 账单催款 Cron 任务（遍历模式） | `app/Console/Commands/BillReminder.php` |
 | 安装模块 Job（显式 company_id 属性） | `app/Jobs/Install/EnableModule.php` |
-| 发票 Notification（关联隐式获取） | `app/Notifications/Sale/Invoice.php` |
+| 发票 Notification（完整序列化模型） | `app/Notifications/Sale/Invoice.php` |
 | 导出完成 Notification（无 SerializesModels） | `app/Notifications/Common/ExportCompleted.php` |
 | 批量下载 Job（company_id() 直接使用） | `app/Jobs/Common/CreateZipForDownload.php` |
 | 导出 Sheet 示例（受 Scope 保护） | `app/Exports/Common/Sheets/Items.php` |
 | 导入 Sheet 示例（显式设置 company_id） | `app/Imports/Common/Sheets/Items.php` |
 | 登出清理 session | `app/Listeners/Auth/Logout.php` |
 | 事件-监听器映射表 | `app/Providers/Event.php` |
+| 事件类示例（异步监听时触发序列化风险） | `app/Events/Document/DocumentCancelled.php` |
+| 更新物品 Job（反序列化风险典型示例） | `app/Jobs/Common/UpdateItem.php` |

@@ -1239,7 +1239,7 @@ SendQueuedNotifications（SerializesModels）
 
 ### 7.7.2 发票通知执行流程中的风险点
 
-**代码路径**：[Invoice.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Notifications/Sale/Invoice.php)
+**代码路径**：[Invoice.php](app/Notifications/Sale/Invoice.php)
 
 #### 风险点 1：`$notifiable`（接收者）跨公司
 
@@ -1293,7 +1293,7 @@ public function getTagsReplacement(): array
 #### 风险点 3：邮件发件人身份伪造
 
 ```php
-// initMailMessage() in [Notification.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Abstracts/Notification.php)
+// initMailMessage() in [Notification.php](app/Abstracts/Notification.php)
 public function initMailMessage(): MailMessage
 {
     app('url')->defaults(['company_id' => company_id()]);  // ⚠️ 依赖上下文
@@ -1329,7 +1329,7 @@ public function initMailMessage(): MailMessage
 
 #### 导出完成通知（ExportCompleted）
 
-**代码路径**：[ExportCompleted.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Notifications/Common/ExportCompleted.php)
+**代码路径**：[ExportCompleted.php](app/Notifications/Common/ExportCompleted.php)
 
 | 属性 | 类型 | 序列化方式 | 风险等级 |
 |------|------|-----------|----------|
@@ -1345,7 +1345,7 @@ public function initMailMessage(): MailMessage
 
 #### 导入完成通知（ImportCompleted）
 
-**代码路径**：[ImportCompleted.php](file:///d:/fz/0601-2/solo-dogfeeding/code/33-akaunting/app/Notifications/Common/ImportCompleted.php)
+**代码路径**：[ImportCompleted.php](app/Notifications/Common/ImportCompleted.php)
 
 | 属性 | 类型 | 序列化方式 | 风险等级 |
 |------|------|-----------|----------|
@@ -1495,6 +1495,7 @@ $victim_user = User::newQueryWithoutScopes()->find(999);  // ⚠️ 加载其他
 |---------|---------|
 | **队列上下文自动管理（核心）** | `app/Providers/Queue.php` |
 | **队列模型反序列化风险分析** | `vendor/laravel/framework/src/Illuminate/Queue/SerializesAndRestoresModelIdentifiers.php` |
+| **通知包装器（关键发现：内部使用 SerializesModels）** | `vendor/laravel/framework/src/Illuminate/Notifications/SendQueuedNotifications.php` |
 | 公司识别中间件 | `app/Http/Middleware/IdentifyCompany.php` |
 | Company ID 解析 Trait | `app/Traits/Companies.php` |
 | Company 模型（上下文管理） | `app/Models/Common/Company.php` |
@@ -1525,8 +1526,13 @@ $victim_user = User::newQueryWithoutScopes()->find(999);  // ⚠️ 加载其他
 | 发票催款 Cron 任务（遍历模式） | `app/Console/Commands/InvoiceReminder.php` |
 | 账单催款 Cron 任务（遍历模式） | `app/Console/Commands/BillReminder.php` |
 | 安装模块 Job（显式 company_id 属性） | `app/Jobs/Install/EnableModule.php` |
-| 发票 Notification（完整序列化模型） | `app/Notifications/Sale/Invoice.php` |
-| 导出完成 Notification（无 SerializesModels） | `app/Notifications/Common/ExportCompleted.php` |
+| 发票 Notification（完整序列化模型 + 接收者越权风险） | `app/Notifications/Sale/Invoice.php` |
+| 账单 Notification（完整序列化模型） | `app/Notifications/Purchase/Bill.php` |
+| 交易 Notification（完整序列化模型） | `app/Notifications/Banking/Transaction.php` |
+| 导出完成 Notification（无模型，仅字符串） | `app/Notifications/Common/ExportCompleted.php` |
+| 导出失败 Notification（无模型） | `app/Notifications/Common/ExportFailed.php` |
+| 导入完成 Notification（无模型） | `app/Notifications/Common/ImportCompleted.php` |
+| 导入失败 Notification（无模型） | `app/Notifications/Common/ImportFailed.php` |
 | 批量下载 Job（company_id() 直接使用） | `app/Jobs/Common/CreateZipForDownload.php` |
 | 导出 Sheet 示例（受 Scope 保护） | `app/Exports/Common/Sheets/Items.php` |
 | 导入 Sheet 示例（显式设置 company_id） | `app/Imports/Common/Sheets/Items.php` |

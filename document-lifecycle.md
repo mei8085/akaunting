@@ -8,6 +8,8 @@ Akaunting 系统中的单据（Document）采用**事件驱动架构**实现状�
 - **Invoice（发票）**：销售方向，状态流转为 `草稿 → 已发送 → 已查看 → 部分付款 → 已付款 / 已作废`
 - **Bill（账单）**：采购方向，状态流转为 `草稿 → 已接收 → 部分付款 → 已付款 / 已作废`
 
+> **关于已批准（approved）/ 已确认（confirmed）状态**：这两种状态在语言翻译和状态守卫中均有定义，属于**为模块扩展预留的状态**（如报价单、采购订单等单据类型需要审批流程）。在 Invoice 和 Bill 的核心业务流程中，**当前版本没有提供直接进入 approved/confirmed 的入口**，而是把发送（sent）/ 接收（received）当作业务上的"确认"动作。它们在状态守卫中被当作"终态"看待，用于防止重复触发通知。
+
 ---
 
 ## 一、状态定义
@@ -115,98 +117,196 @@ event(new DocumentCreated($this->model, $this->request));
 
 ---
 
-### 3.2 发送：草稿 → 已发送（Draft → Sent）
+### 3.2 发票发送/确认：草稿 → 已发送（Draft → Sent）
 
 **适用类型**：Invoice
 
-**入口**：
-- [Invoices::markSent()](app/Http/Controllers/Sales/Invoices.php#L259-L268) - 手动标记已发送
-- [SendDocument](app/Jobs/Document/SendDocument.php) Job - 邮件发送
+**入口（共 3 个）**：
+
+| 入口类型 | 代码位置 | 触发场景 |
+|---------|---------|---------|
+| 手动标记（单条） | [Invoices::markSent()](app/Http/Controllers/Sales/Invoices.php#L259-L268) | 管理员在详情页点击"标记已发送" |
+| 批量操作 | [Invoices::sent()](app/BulkActions/Sales/Invoices.php#L102-L113) | 在列表页批量勾选后选择"标记已发送" |
+| 邮件发送 Job | [SendDocument](app/Jobs/Document/SendDocument.php) | 创建时勾选"发送邮件"或手动点击"发送邮件" |
+
+> **业务含义**：在 Invoice 核心流程中，`sent` 状态即是"已确认"状态，表示发票已正式发出给客户，相当于业务上的"确认"动作。`approved` 状态为模块扩展预留，核心流程未使用。
+
+#### 代码走向（手动标记单条）
 
 ```
-Controller::markSent()
+Invoices::markSent($invoice)
     ↓
 event(new DocumentMarkedSent($invoice))
     ↓
+┌─ Event.php 监听配置 ─────────────────────────────────────┐
+│  DocumentMarkedSent → MarkDocumentSent                    │
+└───────────────────────────────────────────────────────────┘
+    ↓
 MarkDocumentSent Listener
-    ├─ 检查状态不是 partial/paid
+    ├─ 状态守卫：if in_array(status, ['partial', 'paid']) 则不改 status
     ├─ $document->status = 'sent'
-    ├─ 特殊：金额为 0 时直接标记为 'paid'
+    ├─ 特殊：金额为 0 → status = 'paid'（零金额直接走完）
     ├─ $document->save()
-    └─ CreateDocumentHistory Job → 记录 "已标记为已发送"
+    └─ dispatch(new CreateDocumentHistory(...))
+           └─ 记录描述："Invoice 已标记为已发送"
 ```
 
-**邮件发送路径** ([SendDocument.php#L17-L27](app/Jobs/Document/SendDocument.php#L17-L27))：
-```php
-public function handle(): void
-{
-    event(new DocumentSending($this->document));
-    $notification = config('type.document.' . $this->document->type . '.notification.class');
-    $this->document->contact->notify(new $notification($this->document, 'invoice_new_customer', true));
-    event(new DocumentSent($this->document));  // 触发状态更新
-}
+#### 代码走向（发送邮件）
+
+[SendDocument.php#L17-L27](app/Jobs/Document/SendDocument.php#L17-L27)：
 ```
+event(new DocumentSending($document))     // 发送前事件
+    ↓
+$contact->notify(new Notification(...))   // 实际发送邮件给客户（带 PDF 附件）
+    ↓
+event(new DocumentSent($document))       // 发送后事件 → 触发 MarkDocumentSent 监听器
+                                          // （与手动标记共用同一个监听器）
+```
+
+#### 影响面汇总
+
+| 维度 | 影响 |
+|------|------|
+| **付款** | 进入 `sent` 状态后，才可在门户页面看到付款按钮，客户可在线支付 |
+| **状态流转** | `draft` → `sent`；后续可被 `viewed`、`partial`、`paid`、`cancelled` 覆盖 |
+| **历史记录** | 创建一条 `document_histories`，status='sent' |
+| **通知** | 手动标记：无额外通知；邮件发送：客户收到 `invoice_new_customer` 邮件（含 PDF） |
+| **编号** | 不触发编号递增（编号在创建时 DocumentCreated 已递增） |
 
 ---
 
-### 3.3 接收：草稿 → 已接收（Draft → Received）
+### 3.3 账单接收：草稿 → 已接收（Draft → Received）
 
 **适用类型**：Bill
 
-**入口**：[Bills::markReceived()](app/Http/Controllers/Purchases/Bills.php#L229-L238)
+**入口（共 3 个）**：
+
+| 入口类型 | 代码位置 | 触发场景 |
+|---------|---------|---------|
+| 手动标记（单条） | [Bills::markReceived()](app/Http/Controllers/Purchases/Bills.php#L229-L238) | 管理员在详情页点击"标记已接收" |
+| 批量操作 | [Bills::received()](app/BulkActions/Purchases/Bills.php#L96-L106) | 在列表页批量勾选后选择"标记已接收" |
+| 循环账单自动生成 | [SendDocumentRecurringNotification](app/Listeners/Document/SendDocumentRecurringNotification.php#L40-L42) | 定时任务生成循环账单时，按 `auto_send` 配置自动触发 |
+
+> **配置说明**：Bill 的 `auto_send` 配置为 `DocumentReceived::class`（见 [type.php#L268](config/type.php#L268)），因此循环账单生成后会自动进入 received 状态。
+
+#### 完整代码走向
 
 ```
-Controller::markReceived()
+入口（任选其一）
     ↓
 event(new DocumentReceived($bill))
     ↓
-MarkDocumentReceived Listener
-    ├─ 检查状态不是 partial/paid
+┌─ Event.php 监听配置 ─────────────────────────────────────┐
+│  DocumentReceived → MarkDocumentReceived                  │
+└───────────────────────────────────────────────────────────┘
+    ↓
+MarkDocumentReceived Listener ([L19-L49](app/Listeners/Document/MarkDocumentReceived.php#L19-L49))
+    ├─ 状态守卫：if in_array(status, ['partial', 'paid']) 则跳过
     ├─ $document->status = 'received'
-    ├─ 特殊：金额为 0 时直接标记为 'paid'
+    ├─ 特殊：金额为 0 → status = 'paid'
     ├─ $document->save()
-    └─ CreateDocumentHistory Job → 记录 "已标记为已接收"
+    └─ dispatch(new CreateDocumentHistory(...))
+           └─ 记录描述："Bill 已标记为已接收"
 ```
 
-**核心代码** ([MarkDocumentReceived.php#L19-L49](app/Listeners/Document/MarkDocumentReceived.php#L19-L49))：
-```php
-if (! in_array($event->document->status, ['partial', 'paid'])) {
-    $event->document->status = 'received';
-    if ($event->document->amount == 0) {
-        $event->document->status = 'paid';
-    }
-    $event->document->save();
-}
-$this->dispatch(new CreateDocumentHistory(...));
-```
+#### 影响面汇总
+
+| 维度 | 影响 |
+|------|------|
+| **付款** | 进入 `received` 状态后，表示确认该账单，可开始记录付款（创建 expense 交易） |
+| **状态流转** | `draft` → `received`；后续可被 `partial`、`paid`、`cancelled` 覆盖 |
+| **历史记录** | 创建一条 `document_histories`，status='received' |
+| **通知** | Bill 的 `notify_contact=false`（见 [type.php#L265](config/type.php#L265)），不会给供应商发邮件 |
+| **循环单据** | 循环 Bill 生成后自动触发本事件，自动变为 received |
 
 ---
 
-### 3.4 查看：已发送 → 已查看（Sent → Viewed）
+### 3.4 发票查看：已发送 → 已查看（Sent → Viewed）
 
 **适用类型**：Invoice
 
-**入口**：客户在门户查看发票时触发 `DocumentViewed` 事件
+**入口（共 3 个）**：
+
+| 入口类型 | 代码位置 | 触发场景 |
+|---------|---------|---------|
+| 门户查看（登录） | [Portal\Invoices::show()](app/Http/Controllers/Portal/Invoices.php#L63) | 客户通过账号登录门户进入发票详情 |
+| 签名链接查看（未登录） | [Portal\Invoices::signed()](app/Http/Controllers/Portal/Invoices.php#L187-L189) | 客户点击邮件中的签名链接（访客或本人查看都触发） |
+| 测试工厂初始化 | [DocumentFactory](database/factories/Document.php#L343-L346) | 仅在测试环境中，seed 数据时触发 |
+
+> **签名链接守卫条件**：signed() 方法有判断（见 [L187-L189](app/Http/Controllers/Portal/Invoices.php#L187-L189)）：仅当 `user()为空（访客）` 或 `user()->id == $invoice->contact->user_id（确实是该客户本人）` 才会记录查看事件，防止公司管理员自己打开链接误触发。
+
+#### 完整代码走向
 
 ```
-DocumentViewed Event
+入口（任选其一）
     ↓
-MarkDocumentViewed Listener
-    ├─ 仅当 status == 'sent' 时执行
-    ├─ $document->status = 'viewed'
-    ├─ $document->save()
-    └─ CreateDocumentHistory Job → 记录 "已被查看"
+event(new DocumentViewed($invoice))
+    ↓
+┌─ Event.php 监听配置 ──────────────────────────────────────────────┐
+│  DocumentViewed → [                                               │
+│    1. MarkDocumentViewed          ← 改状态 + 留历史                │
+│    2. SendDocumentViewNotification ← 给公司管理员发通知             │
+│  ]                                                                 │
+└────────────────────────────────────────────────────────────────────┘
+    │
+    ├─→ MarkDocumentViewed Listener ([L19-L49](app/Listeners/Document/MarkDocumentViewed.php#L19-L49))
+    │     ├─ 状态守卫：$document->status != 'sent' → 直接 return
+    │     │           （已看过或更后状态，不重复记）
+    │     ├─ $document->status = 'viewed'
+    │     ├─ $document->save()
+    │     └─ dispatch(new CreateDocumentHistory(...))
+    │            └─ 记录描述："Invoice 已被查看"
+    │
+    └─→ SendDocumentViewNotification Listener ([L18-L50](app/Listeners/Document/SendDocumentViewNotification.php#L18-L50))
+          ├─ 终态守卫：if status in ['viewed','approved','received',
+          │                          'refused','partial','paid',
+          │                          'cancelled','voided',
+          │                          'completed','refunded'] → return
+          │   （防止重复发送通知）
+          ├─ 从配置读取 notification class 和 notify_user 开关
+          ├─ 若 notify_user=false → return
+          └─ foreach($document->company->users as $user)：
+               有权限的用户 → notify("invoice_view_admin" 模板通知)
 ```
 
-**核心代码** ([MarkDocumentViewed.php#L19-L49](app/Listeners/Document/MarkDocumentViewed.php#L19-L49))：
-```php
-if ($document->status != 'sent') {
-    return;
-}
-$document->status = 'viewed';
-$document->save();
-$this->dispatch(new CreateDocumentHistory(...));
-```
+#### 影响面汇总
+
+| 维度 | 影响 |
+|------|------|
+| **付款** | 不影响付款功能（viewed 与 sent 一样可付款，都属于"待付款"状态） |
+| **状态流转** | 仅能从 `sent` 转入 `viewed`；不能从 draft 或其他状态转入 |
+| **历史记录** | 创建一条 `document_histories`，status='viewed' |
+| **通知** | 给公司内有权限的管理员发送"客户已查看"通知；不给客户发；终态守卫防止重复 |
+| **approved 的作用** | 虽然未在核心流程中使用，但在终态守卫列表中出现。若模块扩展将 Invoice 设为 approved，系统会把它视为"已确认终态"，不再触发查看通知 |
+
+---
+
+### 3.4.1 已批准（Approved）/ 已确认（Confirmed）状态说明
+
+**存在位置**：
+- 语言翻译：[documents.php#L32](resources/lang/en-US/documents.php#L32) 和 [L60](resources/lang/en-US/documents.php#L60)
+- Invoice 状态列表：[Documents.php#L72-L82](app/Traits/Documents.php#L72-L82) 中列有 `approved`
+- 终态守卫：[SendDocumentViewNotification.php#L22-L25](app/Listeners/Document/SendDocumentViewNotification.php#L22-L25) 把 approved 列入"已确认终态"
+
+**当前版本行为（Invoice/Bill 核心流程）**：
+- ❌ 没有 `DocumentApproved` / `DocumentConfirmed` 事件
+- ❌ 没有 `MarkDocumentApproved` / `MarkDocumentConfirmed` 监听器
+- ❌ 没有 `markApproved()` / `markConfirmed()` 控制器方法
+- ❌ 控制器的行操作中未提供"批准/确认"按钮
+
+**业务上"确认"动作的替代**：
+在 Invoice/Bill 的核心流程中，把以下状态视为确认：
+- Invoice：`sent`（已发送）即表示业务上已确认发出
+- Bill：`received`（已接收）即表示业务上已确认接收
+
+**模块扩展方向**：
+如果开发"报价单（Quote/Estimate）"、"采购订单（Purchase Order）"等需要独立审批的单据类型，可以按以下方式接入：
+1. 在自定义模块 Service Provider 中补充 Event 监听：
+   ```php
+   DocumentApproved::class => [YourModule\Listeners\MarkDocumentApproved::class]
+   ```
+2. 在控制器中加入 `markApproved()`，调用 `event(new DocumentApproved($doc))`
+3. 系统会自动把 `approved` 作为终态，不再触发查看通知（终态守卫中已包含该状态，无需修改核心代码）
 
 ---
 
@@ -325,6 +425,7 @@ Invoice 路径:
                   ├─ 邮件发送 → DocumentSent → sent
                   │                       ↓
                   │               客户查看 → DocumentViewed → viewed
+                  │   （门户show/signed，双守卫：仅sent可转，且是真实客户）
                   │                       ↓
                   └───────────────────────┼─────────────────┐
                                           ↓                 │
@@ -333,11 +434,14 @@ Invoice 路径:
                             全部付款 → PaymentReceived → paid ◄┘
                                           ↓
                             手动作废 → DocumentCancelled → cancelled
+                        （需通过对账检查；先删关联交易再改状态）
 
 
 Bill 路径:
    新建 → draft ──┐
                   ├─ markReceived() → DocumentReceived → received
+                  ├─ 批量received() → DocumentReceived → received
+                  ├─ 循环生成 → auto_send(DocumentReceived) → received
                   │                       ↓
                   └───────────────────────┼─────────────────┐
                                           ↓                 │
@@ -362,9 +466,12 @@ Bill 路径:
 
 每个状态变化都有对应的领域事件：
 - `DocumentCreating` / `DocumentCreated`
-- `DocumentSending` / `DocumentSent`
+- `DocumentSending` / `DocumentSent` / `DocumentMarkedSent`
+- `DocumentReceived`
+- `DocumentViewed`
 - `DocumentCancelled`
-- `PaymentReceived`
+- `PaymentReceived` / `PaidAmountCalculated`
+- `DocumentTransactionCreating` / `DocumentTransactionCreated`
 
 ### 5.3 状态守卫（Status Guard）
 
@@ -372,6 +479,8 @@ Bill 路径:
 - 作废前检查是否已对账
 - 联系人变更时检查状态是否已锁定（`sent`, `received`, `viewed`, `partial`, `paid`, `overdue`, `unpaid`, `cancelled`）
 - 查看状态仅能从 `sent` 转入 `viewed`
+- 查看通知有终态守卫（11 种状态均不再重复发通知）
+- 签名链接查看有身份守卫（非真实客户浏览不计入）
 
 ---
 
@@ -382,6 +491,7 @@ Bill 路径:
 | 模型 | [Document.php](app/Models/Document/Document.php) |
 | 模型 | [DocumentHistory.php](app/Models/Document/DocumentHistory.php) |
 | 特性 | [Documents.php](app/Traits/Documents.php) |
+| 配置 | [type.php](config/type.php)（auto_send、notification、status_workflow） |
 | 服务提供者 | [Event.php](app/Providers/Event.php) |
 | 创建 Job | [CreateDocument.php](app/Jobs/Document/CreateDocument.php) |
 | 更新 Job | [UpdateDocument.php](app/Jobs/Document/UpdateDocument.php) |
@@ -392,5 +502,10 @@ Bill 路径:
 | 监听器 | [MarkDocumentReceived.php](app/Listeners/Document/MarkDocumentReceived.php) |
 | 监听器 | [MarkDocumentViewed.php](app/Listeners/Document/MarkDocumentViewed.php) |
 | 监听器 | [MarkDocumentCancelled.php](app/Listeners/Document/MarkDocumentCancelled.php) |
+| 监听器 | [SendDocumentViewNotification.php](app/Listeners/Document/SendDocumentViewNotification.php) |
+| 监听器 | [SendDocumentRecurringNotification.php](app/Listeners/Document/SendDocumentRecurringNotification.php) |
 | 控制器 | [Invoices.php](app/Http/Controllers/Sales/Invoices.php) |
 | 控制器 | [Bills.php](app/Http/Controllers/Purchases/Bills.php) |
+| 控制器 | [Portal\Invoices.php](app/Http/Controllers/Portal/Invoices.php)（查看入口） |
+| 批量操作 | [BulkActions\Sales\Invoices.php](app/BulkActions/Sales/Invoices.php) |
+| 批量操作 | [BulkActions\Purchases\Bills.php](app/BulkActions/Purchases/Bills.php) |

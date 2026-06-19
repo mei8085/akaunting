@@ -310,130 +310,212 @@ event(new DocumentViewed($invoice))
 
 ---
 
-### 3.5 付款完整链路：在线支付 → 确认 → 部分付款/已付款
+### 3.5 付款完整链路：地址生成 → 前端请求 → 模块确认 → 状态更新
 
-付款流程分为 **3 大阶段**：**①确认地址生成** → **②请求流转到支付模块** → **③支付成功触发事件并更新状态**。
+付款流程分为 **4 大阶段**：
+**①两类确认地址的注册与生成** → **②前端 Vue + axios 请求支付模块** → **③支付确认（同步 + 异步双路径）** → **④触发 PaymentReceived 事件并更新状态**。
 
 ---
 
-#### 3.5.1 阶段一：确认地址（signed URL）生成
+#### 3.5.1 阶段一：两类确认地址的注册与生成
 
-signed URL 使用 Laravel 的 `URL::signedRoute()` 生成，附带 `signature` 查询参数防篡改，不需要客户登录即可访问。
+系统中有 **两套完全不同层级** 的 "confirm" 路由，切勿混淆：
 
-**生成位置（共 5 处）**：
+| 维度 | 核心 confirm 路由 | 支付模块 confirm 路由 |
+|------|------------------|---------------------|
+| **路由名** | `signed.invoices.confirm` | `signed.{alias}.invoices.confirm` |
+| **注册位置** | [routes/signed.php#L16](routes/signed.php#L16) | 各支付模块通过 `Route::signed()` 宏注册 |
+| **控制器** | `Portal\Invoices@confirm`（⚠️ 方法不存在，预留） | 各模块自己的 `{Alias}PaymentController@confirm` |
+| **用途** | 为模块扩展预留的通用入口 | **实际支付确认真正使用的地址** |
+| **是否命中** | 核心流程中不会走到 | 客户提交支付表单时真正命中 |
 
-| 场景 | 代码位置 | 生成内容 |
-|------|---------|---------|
-| 邮件通知发送给客户 | [Invoice.php#L155](app/Notifications/Sale/Invoice.php#L155) | `signed.invoices.show`（发票详情查看地址） |
-| 付款完成通知客户 | [PaymentReceived.php#L138](app/Notifications/Portal/PaymentReceived.php#L138) | `signed.invoices.show` |
-| 查看链接签名页初始化 payment_actions | [Portal\Invoices@signed#L175-L180](app/Http/Controllers/Portal/Invoices.php#L175-L180) | 循环 `Modules::getPaymentMethods()`，为每个支付方法生成 `signed.{alias}.invoices.show` 作为支付入口 |
-| 预览页初始化 payment_actions | [Portal\Invoices@preview#L144-L150](app/Http/Controllers/Portal/Invoices.php#L144-L150) | 同上 |
-| PaymentController 动态生成 URL | [PaymentController.php#L155-L160](app/Abstracts/Http/PaymentController.php#L155-L160) | 根据请求来源（portal 或 signed）生成 `confirm`、`return`、`cancel`、`finish`、`notify` 5 种回调 URL |
+> **核心路由的 confirm/payment 方法缺失说明**：在 `routes/signed.php` 中注册了 `signed.invoices.payment` 和 `signed.invoices.confirm`，但 [Portal\Invoices.php](app/Http/Controllers/Portal/Invoices.php) 控制器中并没有 `payment()` 和 `confirm()` 方法。这两个路由是**为未来通用支付流程预留的占位路由**，实际支付确认均走各支付模块自己的路由。
 
-**signed 路由注册**（见 [signed.php#L12-L21](routes/signed.php#L12-L21)）：
+##### 支付模块路由如何注册（Route Macro 机制）
+
+在 [Route.php#L97-L103](app/Providers/Route.php#L97-L103) 中定义了 `Route::signed()` 宏：
 ```php
-// 核心路由
-Route::get( 'invoices/{invoice}',          'Portal\Invoices@signed' )->name('signed.invoices.show');
-Route::post('invoices/{invoice}/payment',  'Portal\Invoices@payment')->name('signed.invoices.payment');
-Route::post('invoices/{invoice}/confirm',  'Portal\Invoices@confirm')->name('signed.invoices.confirm');
-Route::get( 'invoices/{invoice}/finish',   'Portal\Invoices@finish' )->name('signed.invoices.finish');
-
-// 支付模块通过 {alias} 动态占位注册，例如 offline-payments 模块：
-// signed.offline-payments.invoices.show    → 支付表单展示
-// signed.offline-payments.invoices.confirm → 确认支付回调
+Facade::macro('signed', function ($alias, $routes, $attributes = []) {
+    return Facade::module($alias, $routes, array_merge([
+        'middleware'    => 'signed',
+        'prefix'        => 'signed/' . $alias,      // URL: /{company_id}/signed/{alias}/...
+        'as'            => 'signed.' . $alias . '.', // 路由名: signed.{alias}....
+    ], $attributes));
+});
 ```
 
-**生成确认地址的核心逻辑** ([PaymentController.php#L135-L160](app/Abstracts/Http/PaymentController.php#L135-L160))：
+各支付模块在自己的 `Routes/signed.php` 中调用：
 ```php
-public function getConfirmUrl($invoice)
-{
-    return $this->getModuleUrl($invoice, 'confirm');
-}
+Route::signed('offline-payments', function () {
+    Route::get('invoices/{invoice}', 'Invoices@show')->name('invoices.show');
+    Route::post('invoices/{invoice}/confirm', 'Invoices@confirm')->name('invoices.confirm');
+    Route::post('invoices/{invoice}/return', 'Invoices@return')->name('invoices.return');
+    Route::post('invoices/{invoice}/cancel', 'Invoices@cancel')->name('invoices.cancel');
+    Route::post('invoices/{invoice}/notify', 'Invoices@notify')->name('invoices.notify');
+});
+```
 
-public function getModuleUrl($invoice, $suffix)
+最终生成：
+- URL：`/{company_id}/signed/offline-payments/invoices/123/confirm`
+- 路由名：`signed.offline-payments.invoices.confirm`
+
+##### signed URL 生成位置汇总
+
+| 场景 | 代码位置 | 生成的 URL / 路由名 |
+|------|---------|-------------------|
+| 邮件中的发票查看链接 | [Invoice.php#L155](app/Notifications/Sale/Invoice.php#L155) | `signed.invoices.show` |
+| 付款完成通知中的链接 | [PaymentReceived.php#L138](app/Notifications/Portal/PaymentReceived.php#L138) | `signed.invoices.show` |
+| 签名页初始化支付方法入口 | [Portal\Invoices@signed#L178-L179](app/Http/Controllers/Portal/Invoices.php#L178-L179) | `signed.{alias}.invoices.show`（每个支付方法一个） |
+| 预览页初始化支付方法入口 | [Portal\Invoices@preview#L148](app/Http/Controllers/Portal/Invoices.php#L148) | 同上 |
+| 支付模块动态生成回调 URL | [PaymentController.php#L155-L160](app/Abstracts/Http/PaymentController.php#L155-L160) | `signed.{alias}.invoices.{suffix}`（confirm/return/cancel/finish 四种走 signed） |
+| 支付模块异步通知地址 | [PaymentController.php#L150-L153](app/Abstracts/Http/PaymentController.php#L150-L153) | `portal.{alias}.invoices.notify`（**不走 signed，详见下文**） |
+
+##### confirm/return/cancel/finish 走 signed URL，notify 为什么单独生成？
+
+`getNotifyUrl()` 的实现（[PaymentController.php#L150-L153](app/Abstracts/Http/PaymentController.php#L150-L153)）：
+```php
+public function getNotifyUrl($invoice)
 {
-    return request()->isPortal($invoice->company_id)
-        ? route('portal.' . $this->alias . '.invoices.' . $suffix, $invoice->id)
-        : URL::signedRoute('signed.' . $this->alias . '.invoices.' . $suffix, [$invoice->id]);
+    return route('portal.' . $this->alias . '.invoices.notify', $invoice->id);
 }
 ```
 
-> **关键**：`$this->alias` 是支付模块的标识（如 `offline-payments`、`stripe`），由各支付模块的 `PaymentController` 子类继承时赋值。
+**notify 不走 signed URL 的 4 个原因**：
+
+| 原因 | 说明 |
+|------|------|
+| **调用方不同** | notify 是**第三方支付平台服务器**主动回调（webhook/IPN），不是用户浏览器访问；signed URL 是给人用的 |
+| **认证方式不同** | 第三方支付平台用**自己的签名机制**（如 HMAC、RSA 等）验证回调合法性，不识别 Laravel 的 `signature` 参数 |
+| **请求方法不同** | signed URL 通过 GET 请求验证 signature；notify 是 **POST 请求**，支付平台把交易数据放在 POST body 里 |
+| **会话无关** | notify 是服务器到服务器的调用，不需要 session、不需要用户态；signed URL 中间件可能带有 session 依赖 |
 
 ---
 
-#### 3.5.2 阶段二：请求流转到支付模块
+#### 3.5.2 阶段二：前端 Vue + axios 如何请求支付模块
 
-完整的请求流转路径如下：
+前端代码位于 [apps.js](resources/assets/js/views/portal/apps.js)，是一个 Vue 实例 + axios 的组合。
+
+有两个相似方法，分别对应 **portal 登录环境** 和 **signed 访客环境**：
+
+| 方法 | 适用场景 | 路径拼接方式 |
+|------|---------|-------------|
+| `onChangePaymentMethod` | portal 登录客户 | `url + '/portal/' + alias + '/invoices/' + doc_id` |
+| `onChangePaymentMethodSigned` | signed 访客 | 从 `payment_action_path[alias]` 读取 PHP 预先生成的 signed URL |
+
+##### signed 环境完整请求流程
 
 ```
-客户收到邮件 → 点击 {invoice_guest_link}
+PHP 端 (Portal\Invoices@signed)
+    │
+    ├─ 循环 Modules::getPaymentMethods()
+    ├─ 生成 $payment_actions[alias] = URL::signedRoute('signed.{alias}.invoices.show', ...)
+    └─ 渲染 Blade 模板，注入 JS 变量：
+          var payment_action_path = {!! json_encode($payment_actions) !!};
+          见 [signed.blade.php#L155-L156](resources/views/portal/invoices/signed.blade.php#L155-L156)
     ↓
-signed.invoices.show ([Portal\Invoices@signed](app/Http/Controllers/Portal/Invoices.php#L165))
+前端 Vue 实例 (apps.js)
     │
-    ├─ 1. Modules::getPaymentMethods()     ← 触发 PaymentMethodShowing 事件收集所有支付模块
-    │                                       见 [Modules.php#L32-L65](app/Utilities/Modules.php#L32-L65)
+    ├─ 用户点击支付方法 Tab → 触发 @click="onChangePaymentMethodSigned('offline-payments')"
+    │   见 [signed.blade.php#L43](resources/views/portal/invoices/signed.blade.php#L43)
     │
-    ├─ 2. 为每个支付方法生成签名入口 URL
-    │     $payment_actions[$codes[0]] = URL::signedRoute('signed.{alias}.invoices.show', ...)
-    │     见 [Invoices.php#L175-L180](app/Http/Controllers/Portal/Invoices.php#L175-L180)
+    ├─ onChangePaymentMethodSigned(payment_method)
+    │   见 [apps.js#L211-L286](resources/assets/js/views/portal/apps.js#L211-L286)
+    │   │
+    │   ├─ 1. payment_method.split('.') → 取出 alias
+    │   ├─ 2. 从 payment_action_path[alias] 取完整 signed URL
+    │   ├─ 3. 显示 loading 状态（spinner 动画）
+    │   ├─ 4. axios.get(payment_action, { params: { payment_method } })
+    │   │      ↓ HTTP GET 到支付模块 show 路由
+    │   │
+    │   └─ 5. .then(response)：
+    │        ├─ 若 response.data.redirect → location = redirect (跳转到第三方支付页)
+    │        ├─ 若 response.data.html → 动态创建 Vue 组件：
+    │        │     template = '<div>' + response.data.html + '</div>'
+    │        │     （将支付模块返回的表单 HTML 注入到 Vue 组件中）
+    │        └─ 组件中表单提交 → 走支付模块自己的 confirm 路由
     │
-    ├─ 3. 渲染 [signed.blade.php](resources/views/portal/invoices/signed.blade.php)
-    │     └─ 传给前端 JS：var payment_action_path = payment_actions
-    │     └─ 前端 Alpine.js：onChangePaymentMethodSigned('{alias}')
-    │            └─ AJAX GET payment_action_path['{alias}']
-    │
-    └─ 4. 触发 DocumentViewed（仅访客或真实客户）
-           见 [Invoices.php#L187-L189](app/Http/Controllers/Portal/Invoices.php#L187-L189)
-           ↓
-AJAX 请求到达支付模块的 show() 方法
-    ↓
-{Module}\Http\Controllers\Portal\{Alias}PaymentController@show
-    ↓   （继承自 [PaymentController](app/Abstracts/Http/PaymentController.php)）
-    │
-    ├─ $confirm_url = $this->getConfirmUrl($invoice)  ← 生成 signed confirm URL
-    ├─ 渲染支付方法表单视图（hosted：信用卡输入框 / redirect：跳转按钮）
-    │   见 [PaymentController.php#L45-L66](app/Abstracts/Http/PaymentController.php#L45-L66)
-    └─ 返回 JSON：{ html: "<form action=$confirm_url method=POST>" }
-           ↓
-客户填写表单或点击按钮 → 提交到 signed confirm URL
+    └─ onRedirectConfirm() → axios.post(redirectForm.action, redirectForm.data())
+          见 [apps.js#L193-L209](resources/assets/js/views/portal/apps.js#L193-L209)
+          （hosted 模式下的二次确认提交）
 ```
 
-**支付方法发现机制**：`Modules::getPaymentMethods()` 触发 `PaymentMethodShowing` 事件，各支付模块通过订阅该事件把自己的 `name`、`code`、`customer`、`order` 等信息挂到 `$modules->payment_methods[]` 上，实现支付插件式扩展。
+**支付模块 show() 返回内容**：各支付模块的 PaymentController 继承 [PaymentController::show()](app/Abstracts/Http/PaymentController.php#L45-L66)，返回 JSON：
+```json
+{
+  "code": "offline-payments",
+  "name": "Offline Payments",
+  "description": "...",
+  "redirect": false,
+  "html": "<form action='{signed_confirm_url}' method='POST'>...表单字段...</form>"
+}
+```
 
 ---
 
-#### 3.5.3 阶段三：支付成功 → 触发 PaymentReceived 事件 → 更新状态
+#### 3.5.3 阶段三：支付确认（同步 + 异步双路径）
 
-**最终触发点**：各支付模块的 `confirm()` 方法或第三方平台异步 `notify()` 回调中，调用 `$this->finish($invoice, $request)`。
+支付确认有**两条独立路径**，最终都调用 `$this->finish()` 触发付款事件：
 
-**完整代码链路**：
+| 路径 | 触发方式 | 路由 | 适用场景 |
+|------|---------|------|---------|
+| **同步 confirm** | 客户浏览器提交表单/跳转返回 | `signed.{alias}.invoices.confirm` | redirect 型支付（跳转到第三方后返回）、hosted 型支付（页面内表单提交） |
+| **异步 notify** | 第三方服务器主动 POST 回调 | `portal.{alias}.invoices.notify` | webhook / IPN 异步通知，确保订单状态可靠更新 |
+
+##### 同步 confirm 路径
+```
+客户填写支付表单 / 第三方支付页跳转返回
+    ↓
+POST signed.{alias}.invoices.confirm
+    ↓
+{Alias}PaymentController::confirm()
+    ├─ 验证支付结果（从 request 中取参数）
+    ├─ 可选：$this->setReference($invoice, $reference) 存第三方交易号到 session
+    └─ return $this->finish($invoice, $request)
+          ↓ 进入付款事件链路（见阶段四）
+```
+
+##### 异步 notify 路径
+```
+第三方支付平台服务器
+    ↓ POST (带第三方签名)
+portal.{alias}.invoices.notify  （注意：不走 signed URL 中间件）
+    ↓
+{Alias}PaymentController::notify()
+    ├─ 验证第三方签名（HMAC / RSA 等，各支付模块自己实现）
+    ├─ 解析支付结果数据
+    └─ return $this->finish($invoice, $request)
+          ↓ 进入付款事件链路（见阶段四）
+```
+
+> **为什么需要两条路径？** 同步路径给客户即时反馈（跳转到成功页），但用户可能中途关闭浏览器；异步 notify 由第三方服务器可靠送达，确保状态最终一致，这是支付系统的标准设计模式。
+
+---
+
+#### 3.5.4 阶段四：触发 PaymentReceived 事件 → 更新状态
+
+`finish()` 方法位于 [PaymentController.php#L95-L119](app/Abstracts/Http/PaymentController.php#L95-L119)，是支付模块与单据系统的唯一交汇点。
+
+**完整链路**：
 
 ```
-{Alias}PaymentController::confirm() / notify()
-    ↓
-调用父类方法：
-    $this->finish($invoice, $request)
-    见 [PaymentController.php#L95-L119](app/Abstracts/Http/PaymentController.php#L95-L119)
+$this->finish($invoice, $request)
     │
-    ├─ Step 1: $this->dispatchPaidEvent($invoice, $request)
+    ├─ Step 1: dispatchPaidEvent()
     │   见 [L170-L180](app/Abstracts/Http/PaymentController.php#L170-L180)
     │   │
-    │   │   构造 $request：
-    │   │   ├─ company_id      = $invoice->company_id
-    │   │   ├─ account_id      = setting('{alias}.account_id')
-    │   │   ├─ amount          = $invoice->amount       ← 注意：默认传全额
-    │   │   ├─ payment_method  = $this->alias
-    │   │   ├─ reference       = $this->getReference()  ← 从 session 取第三方交易号
-    │   │   └─ type            = 'income'
+    │   │  构造 $request（补齐字段）：
+    │   │  ├─ company_id      = $invoice->company_id
+    │   │  ├─ account_id      = setting('{alias}.account_id', default.account)
+    │   │  ├─ amount          = $invoice->amount       ← 默认传发票全额
+    │   │  ├─ payment_method  = $this->alias
+    │   │  ├─ reference       = $this->getReference()  ← 从 session 取
+    │   │  └─ type            = 'income'
     │   │
     │   └─ event(new PaymentReceived($invoice, $request))
     │          │
-    │          │  PaymentReceived 构造函数补充字段：
-    │          │  见 [PaymentReceived.php#L21-L30](app/Events/Document/PaymentReceived.php#L21-L30)
-    │          └─ if (empty($request['number'])) {
-    │                $request['number'] = $this->getNextTransactionNumber();
-    │             }
+    │          │  [PaymentReceived 构造函数](app/Events/Document/PaymentReceived.php#L21-L30)
+    │          └─ 若 empty($request['number'])
+    │               $request['number'] = $this->getNextTransactionNumber();
     │
     │   ┌─ Event.php 监听配置 ─────────────────────────────────────────┐
     │   │  PaymentReceived::class => [                                  │
@@ -442,127 +524,91 @@ AJAX 请求到达支付模块的 show() 方法
     │   │  ]                                                             │
     │   └───────────────────────────────────────────────────────────────┘
     │          │
-    │          ├─→ [1] CreateDocumentTransaction Listener
+    │          ├─→ [Listener 1] CreateDocumentTransaction
     │          │     见 [CreateDocumentTransaction.php#L20-L50](app/Listeners/Document/CreateDocumentTransaction.php#L20-L50)
     │          │     │
     │          │     └─ dispatch(new CreateBankingDocumentTransaction($doc, $request))
     │          │            见 [CreateBankingDocumentTransaction.php](app/Jobs/Banking/CreateBankingDocumentTransaction.php)
     │          │            │
-    │          │            ├─ Step 1: prepareRequest() 补齐 request 字段
+    │          │            ├─ 1. prepareRequest() 补齐请求字段
     │          │            │
-    │          │            ├─ Step 2: checkAmount()  ← **状态计算核心**
+    │          │            ├─ 2. checkAmount()  ← 状态计算核心
     │          │            │   见 [L74-L123](app/Jobs/Banking/CreateBankingDocumentTransaction.php#L74-L123)
     │          │            │   │
-    │          │            │   ├─ $model->paid_amount = $model->paid;  // 累计已付
+    │          │            │   ├─ $model->paid_amount = $model->paid
     │          │            │   ├─ event(new PaidAmountCalculated($model))
-    │          │            │   ├─ $total = $amount - $paid_amount;     // 未付金额
-    │          │            │   └─ bccomp($本次支付, $未付, 精度)
-    │          │            │       ├─ 1 (超额)  → throw Exception 阻止
-    │          │            │       ├─ 0 (全额)  → $model->status = 'paid'
-    │          │            │       └─ -1(部分)  → $model->status = 'partial'
+    │          │            │   ├─ $未付 = $总额 - $已付
+    │          │            │   └─ bccomp(本次支付, 未付, 精度):
+    │          │            │        1 → 超额 → Exception
+    │          │            │        0 → 全额 → status = 'paid'
+    │          │            │       -1 → 部分 → status = 'partial'
     │          │            │
-    │          │            ├─ Step 3: dispatch(new CreateTransaction($request))
-    │          │            │   └─ 写入 banking_transactions 表，关联 invoice_id
+    │          │            ├─ 3. CreateTransaction Job → 写 banking_transactions
     │          │            │
-    │          │            ├─ Step 4: $model->save()
-    │          │            │   └─ documents.status 字段持久化 partial/paid
+    │          │            ├─ 4. $model->save() → documents.status 持久化
     │          │            │
-    │          │            ├─ Step 5: dispatch(new CreateDocumentHistory(...))
-    │          │            │   └─ 写入 document_histories：
-    │          │            │      status='partial'/ 'paid'
-    │          │            │      notify=0（付款不走通知）
-    │          │            │      description=记录付款金额
+    │          │            ├─ 5. CreateDocumentHistory Job → 写历史
     │          │            │
-    │          │            └─ Step 6: event(new DocumentTransactionCreated(...))
+    │          │            └─ 6. event(new DocumentTransactionCreated())
     │          │
-    │          └─→ [2] SendDocumentPaymentNotification Listener
+    │          └─→ [Listener 2] SendDocumentPaymentNotification
     │               见 [SendDocumentPaymentNotification.php#L16-L42](app/Listeners/Document/SendDocumentPaymentNotification.php#L16-L42)
     │               │
-    │               ├─ 守卫：$request['type'] !== 'income' → return
-    │               │        （Bill 付款不给客户发通知）
-    │               ├─ Notify 客户：$document->contact->notify(
-    │               │     new PaymentReceived($doc, $txn, 'invoice_payment_customer'))
-    │               │
-    │               └─ Notify 公司管理员：foreach($company->users)
-    │                      有权限的用户 → notify(
-    │                         new PaymentReceived($doc, $txn, 'invoice_payment_admin'))
+    │               ├─ 守卫：type !== 'income' → return（Bill 不给客户发通知）
+    │               ├─ 客户：notify('invoice_payment_customer' 模板)
+    │               └─ 公司管理员：有权限用户 → notify('invoice_payment_admin')
     │
-    ├─ Step 2: $this->forgetReference($invoice)  ← 清 session
+    ├─ Step 2: forgetReference($invoice)  ← 清 session 中的第三方交易号
     │
     └─ Step 3: 生成 finish_url 并 redirect
-              见 [L128-L133](app/Abstracts/Http/PaymentController.php#L128-L133)
-                   渲染 [finish.blade.php](resources/views/portal/invoices/finish.blade.php)
-                   显示付款成功提示
+              渲染 [finish.blade.php](resources/views/portal/invoices/finish.blade.php)
+              显示付款成功提示
 ```
 
-#### 3.5.4 影响面汇总（付款）
+##### 状态更新核心逻辑 ([CreateBankingDocumentTransaction.php#L98-L116](app/Jobs/Banking/CreateBankingDocumentTransaction.php#L98-L116))
+
+```php
+$paid_amount = money((float) $this->model->paid, $this->model->currency_code, true)->getValue();
+
+// 触发事件允许其他模块干预已付金额计算
+event(new PaidAmountCalculated($this->model));
+
+$total_amount = money((float) $this->model->amount - (float) $this->model->paid_amount, ...)
+    ->getValue();
+
+$compare = bccomp($this->model->amount, $this->model->paid_amount, $precision);
+
+if ($compare === 1) {
+    throw new \Exception(trans('messages.error.over_payment', ['type' => trans_choice('general.invoices', 1)]));
+} else {
+    $this->model->status = ($compare === 0) ? 'paid' : 'partial';
+}
+```
+
+> **注意**：`bccomp(A, B)` 返回 `A > B → 1`、`A == B → 0`、`A < B → -1`。这里比较的是**发票总额 vs 累计已付**，即支付后累计已付达到总额就是 paid，否则 partial。
+
+---
+
+#### 3.5.5 影响面汇总
 
 | 维度 | 影响 |
 |------|------|
-| **状态流转** | `sent/viewed` → `partial` → `paid`（按本次支付金额与未付金额比例决定）；防止超额支付 |
-| **付款记录** | 写入 `banking_transactions`（银行交易），关联 `document_id`，记录 `payment_method` 模块代码和 `reference` 第三方交易号 |
-| **历史记录** | 写入 `document_histories`，`status` 字段为当前付款状态，`description` 含付款金额 |
-| **通知** | 客户：收到 `invoice_payment_customer` 邮件；管理员：收到 `invoice_payment_admin` 通知；Bill 类型付款无通知（type!==income 守卫） |
+| **状态流转** | `sent / viewed` → `partial` → `paid`，按累计已付与总额比较决定；超额支付直接抛异常阻止 |
+| **付款记录** | 写入 `banking_transactions`，关联 `document_id`，记录 `payment_method` 模块代码和 `reference` 第三方交易号 |
+| **历史记录** | 写入 `document_histories`，`status` 为 `partial` / `paid`，`description` 含付款金额 |
+| **通知** | 客户收到 `invoice_payment_customer` 邮件；管理员收到 `invoice_payment_admin` 通知；Bill 类型付款无客户通知（`type !== 'income'` 守卫） |
 | **Session** | 清除 `{alias}_{invoice_id}_reference` 第三方交易号 |
 | **异常处理** | `CreateDocumentTransaction` 中 try/catch：超额支付/状态冲突时 flash 错误并 redirect 回 show 页面，不抛异常给客户 |
 
 ---
 
-#### 3.5.5 手动记录付款入口（后台操作）
+#### 3.5.6 手动记录付款入口（后台操作）
 
 **入口**：管理员在 Invoice/Bill 详情页点击"添加付款"按钮。
 
 路径：`Sales\Transactions@store` → 直接调用 `event(new PaymentReceived($document, $request))`。
 
-与在线支付相同：复用同一套 Listener/Job 链路（`CreateDocumentTransaction` → `CreateBankingDocumentTransaction`），状态计算逻辑完全一致。
-
----
-
-#### 3.5 付款：→ 部分付款 → 已付款（→ Partial → Paid）
-
-> 详细完整链路见上一节 **3.5.x 付款完整链路**。以下为简化图：
-
-```
-PaymentReceived Event
-    ├─ CreateDocumentTransaction Listener
-    │   └─ CreateBankingDocumentTransaction Job
-    │       ├─ event(new DocumentTransactionCreating())
-    │       ├─ prepareRequest()
-    │       ├─ checkAmount()  ← 状态更新核心逻辑
-    │       │   ├─ 计算已付金额和未付金额
-    │       │   ├─ 检查超额支付
-    │       │   └─ 更新状态：
-    │       │       ├─ 支付金额 == 未付金额 → 'paid'
-    │       │       └─ 支付金额 < 未付金额 → 'partial'
-    │       ├─ CreateTransaction Job → 创建银行交易记录
-    │       ├─ $model->save()
-    │       ├─ CreateDocumentHistory Job → 记录付款金额
-    │       └─ event(new DocumentTransactionCreated())
-    │
-    └─ SendDocumentPaymentNotification Listener
-        ├─ 通知客户付款成功
-        └─ 通知公司管理员
-```
-
-**状态更新核心逻辑** ([CreateBankingDocumentTransaction.php#L74-L123](app/Jobs/Banking/CreateBankingDocumentTransaction.php#L74-L123))：
-```php
-protected function checkAmount(): bool
-{
-    // 计算已付金额和未付金额
-    $this->model->paid_amount = $this->model->paid;
-    event(new PaidAmountCalculated($this->model));
-    $total_amount = round($this->model->amount - $this->model->paid_amount, $precision);
-
-    $compare = bccomp($amount, $total_amount, $precision);
-
-    if ($compare === 1) {
-        throw new \Exception(trans('messages.error.over_payment', ...));
-    } else {
-        $this->model->status = ($compare === 0) ? 'paid' : 'partial';
-    }
-    return true;
-}
-```
+与在线支付**完全复用**同一套 Listener/Job 链路（`CreateDocumentTransaction` → `CreateBankingDocumentTransaction`），状态计算逻辑完全一致。
 
 ---
 

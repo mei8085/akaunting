@@ -109,46 +109,296 @@ round($this->request['amount'], $precision);
 
 ---
 
-## 三、单据总额输出流程
+## 三、页面录单的汇率切换
 
-### 3.1 整体流程
+### 3.1 入口位置
+
+汇率切换位于单据录单页面底部的总额区域：
+- 视图：[resources/views/components/documents/form/totals.blade.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/views/components/documents/form/totals.blade.php#L180-L196)
+- 组件：总额行（tr-total）中的 `<x-form.group.select name="currency_code">` 下拉框
+
+### 3.2 切换事件流程
+
+触发方法：[onChangeCurrency()](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/views/common/documents.js#L794-L828)
+
+```
+用户选择新币种 → onChangeCurrency(currency_code)
+  ↓
+首次触发时：异步拉取 /settings/currencies 接口，获取公司所有币种列表
+  ↓
+遍历 currencies，匹配 code
+  ↓
+1. this.currency = 匹配到的币种对象（含 precision、symbol 等）
+2. this.form.currency_code = 新币种代码
+3. this.form.currency_rate = 新币种的 rate（来自 currencies 表）
+4. 更新 currency_symbol（用于换算显示）
+  ↓
+调用 currencyConversion() → 调整输入框宽度
+```
+
+### 3.3 汇率可手动编辑
+
+在币种切换行下方，当**选择的币种 ≠ 公司默认币种**时，显示汇率换算组件：
+
+- 组件：[AkauntingCurrencyConversion.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/components/AkauntingCurrencyConversion.vue)
+- 显示内容：
+  - 左侧：换算后的默认币种金额（只读）：`(totals.total / form.currency_rate).toFixed(2)`
+  - 中间：说明文本
+  - 右侧：`currency_rate` 输入框，用户可手动编辑
+- 事件：输入框 `@input` 触发 `onChange` → emit 到父组件 → `form.currency_rate = $event`
+
+### 3.4 切换币种后总额的行为
+
+**关键**：切换币种后，`totals.sub`、`totals.discount`、`totals.taxes`、`totals.total` 的**数值本身不会被立即重新换算**。它们仍然按原来币种的数值存储，只是：
+
+1. 金额输入框的格式（符号、千分位、小数位）会按新币种的属性变化（由 `<akaunting-money>` 的 `dynamicCurrency` 机制响应）
+2. 汇率组件按新的 `currency_rate` 展示换算后的默认币种金额
+3. **真正按新币种做数值换算的工作在后端完成**：当用户点击保存后，后端 Job 会按 `form.currency_code` 和 `form.currency_rate` 重新处理所有金额
+
+### 3.5 编辑状态下的限制
+
+- 编辑单据时（`edit.status = true`），前两次币种切换**不生效**（`edit.currency` 计数器从 1 递增到 3 后才允许切换）
+- 这是为了防止编辑时因 created 钩子中的初始化流程误触发币种变更
+
+---
+
+## 四、付款换算（跨币种付款）
+
+### 4.1 场景说明
+
+当用户用与**单据币种不同**的账户/币种付款时，需要处理付款金额与单据金额的换算。
+
+涉及文件：
+- 视图：[resources/views/modals/documents/payment.blade.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/views/modals/documents/payment.blade.php)
+- 控制器：[app/Http/Controllers/Modals/DocumentTransactions.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/app/Http/Controllers/Modals/DocumentTransactions.php)
+- 逻辑：[resources/assets/js/views/common/documents.js](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/views/common/documents.js)
+
+### 4.2 模态框中的隐藏字段
+
+付款模态框在渲染时，会注入以下隐藏字段作为换算基准：
+
+| 字段 | 含义 | 来源 |
+|------|------|------|
+| `document_currency_code` | 单据币种 | `$document->currency_code` |
+| `document_currency_rate` | 单据创建时的汇率 | `$document->currency_rate` |
+| `document_default_amount` | 单据总额（按默认货币） | `$document->grand_total` |
+| `company_currency_code` | 公司默认币种 | `default_currency()` |
+| `paid_amount` | 已付款金额（单据币种） | `$document->paid` |
+
+### 4.3 付款账户切换后的金额换算
+
+触发方法：[onChangeCurrencyPaymentAccount(currency_code)](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/views/common/documents.js#L120-L153)
+
+当用户选择付款账户（即切换付款币种 `form.currency_code`）时：
+
+```
+  付款币种 == 单据币种？
+    ├─ 是 → 无需换算，直接使用 form.amount
+    └─ 否 → 执行 convertBetween：
+              将 form.amount（原付款币种金额）
+              → 换算为新的付款币种金额
+                （按 form.currency_rate 作为新币种汇率）
+              ↓
+              然后做溢出检查：
+                如果换算后金额 > 单据总额，则自动调整为
+                「单据总额反向换算到付款币种」的值
+```
+
+### 4.4 付款金额变化时的双向校验
+
+触发方法：[onChangeAmount(amount)](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/views/common/documents.js#L155-L189)
+
+用户在付款输入框输入金额后：
+1. 将输入的**付款币种金额** → 通过 `convertBetween` 换算为**单据币种金额**
+2. 将换算结果写入 `form.default_amount`（作为换算回显）
+3. 如果换算后超过了 `document_default_amount`，提示并自动截断
+
+### 4.5 汇率手动变更 & "全额付款"
+
+两种方式调整汇率：
+
+**方式一：直接编辑汇率输入框** → [onChangeRatePayment()](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/views/common/documents.js#L191-L197)
+- 更新 `form.currency_rate`
+- 重新触发 `onChangeAmount` 刷新换算回显
+
+**方式二：勾选「Pay in full」（全额付款）** → [onChangePayInFull()](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/views/common/documents.js#L199-L213)
+- 反推汇率：`rate = (document_currency_rate / document_default_amount) * form.amount`
+- 更新 `form.currency_rate`
+- 重新触发 `onChangeAmount` 刷新换算回显
+- 此时 `currency_rate` 输入框被设为 disabled（不允许手动改）
+
+### 4.6 后端：单据已付款金额的累计换算
+
+属性访问器：[getPaidAttribute()](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/app/Models/Document/Document.php#L373-L407)
+
+```php
+$paid = 0;
+foreach ($this->transactions as $transaction) {
+    $amount = $transaction->amount;  // 付款币种金额
+
+    if ($单据币种 != $transaction->currency_code) {
+        // convertBetween：付款币种 → 单据币种
+        $amount = $this->convertBetween(
+            $amount,
+            $transaction->currency_code,
+            $transaction->currency_rate,
+            $单据币种,
+            $单据->currency_rate
+        );
+    }
+    $paid += $amount;
+}
+return round($paid, $单据币种精度);
+```
+
+**要点**：每笔交易都用自己创建时快照的 `currency_rate` 做换算，累计后按单据币种精度 round。
+
+---
+
+## 五、单据总额输出流程（税额 & 行金额拆分详解）
+
+### 5.1 整体流程
 
 入口任务：[CreateDocumentItemsAndTotals.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/app/Jobs/Document/CreateDocumentItemsAndTotals.php)
 
 ```
-创建单据 → 创建明细行（items） → 计算分项总额（totals） → 写入总额（amount）
+创建单据 → 遍历 items：
+              每个 item 调用 CreateDocumentItem（完成单条 item 的折扣+税额计算）
+          ↓
+汇总各 item 的 sub_total、actual_total、折扣合计、按税种聚合的 taxes 数组
+          ↓
+按 sort_order 依次写入 document_totals：
+  sub_total → item_discount → discount → tax[n] → extra[n] → total
+          ↓
+最终总额写入 documents.amount
 ```
 
-### 3.2 分项计算顺序
+### 5.2 单条明细行计算（CreateDocumentItem）
 
-| 序号 | 项目 | code | 计算方式 |
-|------|------|------|----------|
-| 1 | 小计 | sub_total | 所有行项目金额之和 |
-| 2 | 行折扣 | item_discount | 每个 item 的折扣之和 |
-| 3 | 整单折扣 | discount | 百分比/固定金额 |
-| 4 | 税 | tax | 支持 normal/inclusive/fixed/withholding/compound 类型 |
-| 5 | 额外项 | extra | 运费等自定义项（可加可减） |
-| 6 | 总额 | total | 最终金额 |
+见 [CreateDocumentItem.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/app/Jobs/Document/CreateDocumentItem.php#L29-L202)
 
-### 3.3 明细行计算
+#### 5.2.1 变量定义与三个"金额"的区别
 
-见 [CreateDocumentItem.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/app/Jobs/Document/CreateDocumentItem.php)：
+处理一条 item 时会同时维护三个不同的金额变量，**这是之前文档描述不准确的关键**：
 
+| 变量 | 含义 | 用途 | 最终写入字段 |
+|------|------|------|------------|
+| `$item_amount` | 单价×数量，不考虑行折扣（含税/不含税随税类型动态变化） | 用于累计 sub_total 的基础 | — |
+| `$item_discounted_amount` | 扣掉**行折扣**和**整单折扣**后的金额 | 作为计算各种税的基数（初始） | — |
+| `$actual_price_item` | 实际行金额（**不含税**） | 最终的 `document_items.total` | `document_items.total` |
+
+#### 5.2.2 计算步骤（按顺序）
+
+**Step 1：行折扣 + 整单折扣**
+```php
+$item_amount = price × quantity;                              // 原始行金额
+$item_discounted_amount = $item_amount;
+
+// 行折扣（percentage / fixed）
+if (item.discount) {
+    $item_discounted_amount -= 行折扣金额;
+}
+// 整单折扣（分摊到此行）
+if (item.global_discount) {
+    $item_discounted_amount -= 整单折扣分摊额;
+}
 ```
-单价 × 数量 → 行金额
-  → 减去行折扣
-    → 减去整单折扣分摊
-      → 加上各种税（按不同类型分别计算）
-        → 行最终金额
+
+**Step 2：按税类型依次处理**（注意：不同税类型写入不同变量）
+
+```php
+$tax_amount = 0;
+$item_tax_total = 0;
+$actual_price_item = $item_amount = $item_discounted_amount;  // 三者初始值相等
+
+// ───────── ① inclusive 税（价内税） ─────────
+if (inclusive 税) {
+    $tax_amount = $item_discounted_amount
+                - ($item_discounted_amount / (1 + rate/100));  // 反向推税额
+    $item_tax_total += $tax_amount;
+
+    // ⚠️ 关键点：价内税需要从行金额中剥离出来
+    $actual_price_item = $item_discounted_amount - $item_tax_total;
+}
+
+// ───────── ② fixed 税（固定税，按数量计） ─────────
+if (fixed 税) {
+    $tax_amount = tax.rate × quantity;                         // 固定税/件 × 数量
+    $item_tax_total += $tax_amount;
+    $item_amount += $tax_amount;                               // ⚠️ 只加 item_amount
+}
+
+// ───────── ③ normal 税（常规价外税） ─────────
+if (normal 税) {
+    $tax_amount = $actual_price_item × (rate/100);             // 基于不含税金额算
+    $item_tax_total += $tax_amount;
+    $item_amount += $tax_amount;                               // ⚠️ 只加 item_amount
+}
+
+// ───────── ④ withholding 税（代扣税，负值） ─────────
+if (withholding 税) {
+    $tax_amount = -( $actual_price_item × (rate/100) );        // 负税额
+    $item_tax_total += $tax_amount;
+    $item_amount += $tax_amount;                               // ⚠️ 相当于扣减
+}
+
+// ───────── ⑤ compound 税（复合税，基于含税总价再计征） ─────────
+if (compound 税) {
+    // ⚠️ 此时 item_amount 已包含 fixed/normal/withholding 的税额
+    $tax_amount = ($item_amount / 100) × compound_rate;
+    $item_tax_total += $tax_amount;
+    // 注意：compound 税不单独加 item_amount，
+    // 后续会和其他税一起累加到 grand_total
+}
 ```
 
-### 3.4 存储位置
+**Step 3：最终写入**
+```php
+$request['total'] = round($actual_price_item, $precision);    // 行金额（不含税）
+$request['tax']   = round($item_tax_total, $precision);       // 行税额合计
 
-- 分项明细：`document_totals` 表，模型 [DocumentTotal.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/app/Models/Document/DocumentTotal.php)
-- 最终总额：`documents.amount` 字段
-- 每个 total 都有 `sort_order` 控制显示顺序
+// 行 taxes 明细写入 document_item_taxes（withholding 用 abs 存绝对值）
+DocumentItemTax::create([
+    'amount' => round(abs($item_tax['amount']), $precision),
+    ...
+]);
+```
 
-### 3.5 模板显示
+**结论修正**：
+- `document_items.total` 存的是**不含税**的行金额（价税分离后）
+- `document_items.tax` 存的是**税额合计**
+- 价内税（inclusive）会**剥离行金额**；价外税（normal、fixed、compound）是在行金额**之外累加**；withholding 是负值**扣减**
+
+### 5.3 前端（documents.js）的对应计算
+
+对应方法：[onCalculateTotal()](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/views/common/documents.js#L310-L393) 与 [calculateItemTax()](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/views/common/documents.js#L395-L530)
+
+前端同样维护 `item.total` 和 `item.grand_total`：
+- `item.total = price × quantity`（每次计算开始重置为原始值）
+- `item.grand_total` = 扣完行折扣、整单折扣后，**加上税后**的最终行金额
+
+### 5.4 分项总额汇总与写入
+
+回到 [CreateDocumentItemsAndTotals.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/app/Jobs/Document/CreateDocumentItemsAndTotals.php#L29-L158) 的 `handle()`：
+
+```php
+// ① createItems 遍历 items，返回四个聚合值
+list($sub_total, $actual_total, $discount_amount_total, $taxes)
+    = $this->createItems();
+
+// ② 依次写入 document_totals（按 sort_order）
+```
+
+| code | 写入金额 | 来源与说明 |
+|------|----------|------------|
+| `sub_total` | `round($sub_total)` | 所有 item 的 `$document_item->total` 之和，即**不含税行金额累计** |
+| `item_discount` | `round($discount_amount_total)` | 各行「行折扣金额」之和，> 0 时才写入 |
+| `discount` | `round($discount_total)` | 整单折扣（%：sub_total × d%；fixed：整单折扣额） |
+| `tax` | `round(abs($tax['amount']))` | 每个税种一条记录，按 `tax_id` 聚合；withholding 也取 abs 存 |
+| `extra` | `round(abs($total['amount']))` | 额外项（运费等）；operator=addition/subtraction 控制加减到 amount |
+| `total` | `$this->request['amount']` | 最终总额：actual_total − 整单折扣 + Σtax.amount + Σextra（±） |
+
+### 5.5 模板显示
 
 在 [default.blade.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/views/components/documents/template/default.blade.php#L313-L373) 中：
 
@@ -158,13 +408,14 @@ round($this->request['amount'], $precision);
 @endforeach
 ```
 
-按 sort_order 遍历 totals，使用 `<x-money>` 组件格式化显示。
+按 `sort_order` 遍历 `document_totals` 记录，使用 `<x-money>` 组件格式化显示。
+注意：`document_totals.code='tax'` 的记录有多个（每个税种一条），显示时会依次列出。
 
 ---
 
-## 四、金额格式化
+## 六、金额格式化
 
-### 4.1 PHP 端格式化
+### 6.1 PHP 端格式化
 
 **辅助函数**：`money($amount, $currency, $convert = true)`
 - 由 `akaunting/laravel-money` 包提供
@@ -181,36 +432,39 @@ round($this->request['amount'], $precision);
 - 千位分隔符（thousands_separator）
 - 小数位数（precision）
 
-### 4.2 JS 端格式化
+### 6.2 JS 端格式化
 
 **Vue 组件**：`<akaunting-money>`
-- 输入组件：[resources/views/components/form/input/money.blade.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/views/components/form/input/money.blade.php)
+- 组件：[resources/assets/js/components/AkauntingMoney.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/components/AkauntingMoney.vue)
+- 视图：[resources/views/components/form/input/money.blade.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/views/components/form/input/money.blade.php)
 - 核心类：[resources/assets/js/plugins/money.js](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/plugins/money.js)
-- 货币类：[resources/assets/js/plugins/currency.js](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/plugins/currency.js)
 
-**format() 方法逻辑**：
+**动态响应币种切换**：
 ```
-amount → 除以 subunit 得到主单位
-  → 按 precision 保留小数
-    → 添加千位分隔符
-      → 添加货币符号前缀/后缀
-        → 处理负号
+watch.dynamicCurrency → this.money = {
+    decimal:   currency.decimal_mark,
+    thousands: currency.thousands_separator,
+    prefix:    symbol_first ? symbol : '',
+    suffix:    !symbol_first ? symbol : '',
+    precision: parseInt(currency.precision),
+}
 ```
+币种切换后，无需重算数值，输入框的显示格式会自动按新币种刷新。
 
-### 4.3 输入解析（Middleware）
+### 6.3 输入解析（Middleware）
 
 请求输入的金额通过 [Money middleware](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/app/Http/Middleware/Money.php) 解析：
 
-1. 检测 `amount`、`sale_price`、`purchase_price`、`opening_balance` 等参数
-2. 处理不同格式的数字字符串（逗号/小数点）
-3. 调用 `money()` 解析为标准金额值
-4. 将解析后的值写回 request
+1. 检测 `amount`、`sale_price`、`purchase_price`、`opening_balance` 等参数，以及 `items[n].price`
+2. 处理不同格式的数字字符串（逗号/小数点混用）
+3. 调用 `money($value, $currency_code, false)` 解析为标准金额值（第三个参数 = false 表示不做格式化，只取数值）
+4. 将解析后的数值写回 request
 
 ---
 
-## 五、币种汇率与金额格式化的边界
+## 七、币种汇率与金额格式化的边界
 
-### 5.1 核心边界划分
+### 7.1 核心边界划分
 
 ```
 ┌─────────────────┐      ┌─────────────────┐
@@ -222,7 +476,7 @@ amount → 除以 subunit 得到主单位
    从一种货币换算到另一种     只是换一种表现形式
 ```
 
-### 5.2 汇率的职责
+### 7.2 汇率的职责
 
 **属于业务逻辑层**，处理货币之间的价值换算：
 
@@ -234,8 +488,9 @@ amount → 除以 subunit 得到主单位
 **相关代码**：
 - [app/Traits/Currencies.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/app/Traits/Currencies.php)
 - `convertToDefault()` / `convertFromDefault()` / `convertBetween()`
+- `getPaidAttribute()`、`getAmountDueAttribute()` 中跨币种累计
 
-### 5.3 格式化的职责
+### 7.3 格式化的职责
 
 **属于显示层**，处理数字到字符串的转换：
 
@@ -248,8 +503,9 @@ amount → 除以 subunit 得到主单位
 - `money()` 函数
 - `<x-money>` 组件
 - `akaunting-money` Vue 组件
+- `<akaunting-currency-conversion>` 组件（仅显示换算，不改变表单数值）
 
-### 5.4 精度的交叉角色
+### 7.4 精度的交叉角色
 
 精度是汇率与格式化之间的交叉点：
 
@@ -260,15 +516,17 @@ amount → 除以 subunit 得到主单位
 
 **注意**：精度首先是币种的固有属性，其次才是格式化参数。格式化不能独立于币种存在，必须依附于具体币种来确定精度。
 
-### 5.5 混淆点澄清
+### 7.5 混淆点澄清
 
 1. **汇率 ≠ 格式**：汇率转换后得到的仍是数值，不是格式化字符串
 2. **格式化不做转换**：格式化只改变显示样式，不做汇率换算
 3. **两者可组合**：先转换汇率得到数值，再格式化显示字符串
+4. **录单切换币种 ≠ 立即换算总额**：前端只是换格式+回显换算值，真正数值换算在保存时由后端 Job 处理
+5. **行金额 ≠ 含税总额**：`document_items.total` 存的是不含税价；税额单独存在 `document_item_taxes` 和 `document_items.tax`
 
-### 5.6 典型调用链
+### 7.6 典型调用链
 
-**场景：显示单据总额**
+**场景 1：显示单据总额**
 
 ```
 document.amount (数值，单据币种)
@@ -276,19 +534,31 @@ document.amount (数值，单据币种)
     → "$1,234.56" (显示字符串)
 ```
 
-**场景：报表按默认货币汇总**
+**场景 2：报表按默认货币汇总**
 
 ```
 document.amount (数值，单据币种)
-  → getAmountConvertedToDefault()  [汇率转换]
+  → convertBetween(amount, doc_currency, doc_rate,
+                   default_currency, 1.0)  [汇率转换]
     → default_amount (数值，默认货币)
       → money(default_amount, default_currency)  [格式化]
         → "¥8,765.43" (显示字符串)
 ```
 
+**场景 3：跨币种付款 → 累计已付款**
+
+```
+transaction.amount (付款币种金额)
+  → convertBetween(amount, pay_currency, pay_rate,
+                   doc_currency, doc_rate)  [汇率转换]
+    → 累加多条 transaction 的换算值
+      → round(合计, 单据币种精度)
+        → document.paid (单据币种数值)
+```
+
 ---
 
-## 六、关键文件索引
+## 八、关键文件索引
 
 | 文件 | 作用 |
 |------|------|
@@ -297,9 +567,16 @@ document.amount (数值，单据币种)
 | [app/Models/Setting/Currency.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/app/Models/Setting/Currency.php) | 币种模型 |
 | [app/Traits/Currencies.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/app/Traits/Currencies.php) | 汇率转换 Trait |
 | [app/Http/Middleware/Money.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/app/Http/Middleware/Money.php) | 金额输入解析中间件 |
-| [app/Jobs/Document/CreateDocumentItemsAndTotals.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/app/Jobs/Document/CreateDocumentItemsAndTotals.php) | 单据总额计算 |
-| [app/Jobs/Document/CreateDocumentItem.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/app/Jobs/Document/CreateDocumentItem.php) | 明细行计算 |
+| [app/Jobs/Document/CreateDocumentItemsAndTotals.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/app/Jobs/Document/CreateDocumentItemsAndTotals.php) | 单据总额计算 Job |
+| [app/Jobs/Document/CreateDocumentItem.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/app/Jobs/Document/CreateDocumentItem.php) | 明细行折扣与税额计算 Job |
+| [app/Models/Document/Document.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/app/Models/Document/Document.php) | 单据模型（getPaidAttribute 跨币种累计） |
 | [app/Models/Document/DocumentTotal.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/app/Models/Document/DocumentTotal.php) | 分项总额模型 |
+| [app/Http/Controllers/Modals/DocumentTransactions.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/app/Http/Controllers/Modals/DocumentTransactions.php) | 付款模态框控制器 |
+| [resources/views/components/documents/form/totals.blade.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/views/components/documents/form/totals.blade.php) | 录单页面总额区域（币种下拉+汇率输入） |
+| [resources/views/modals/documents/payment.blade.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/views/modals/documents/payment.blade.php) | 付款模态框视图 |
 | [resources/views/vendor/money/components/money.blade.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/views/vendor/money/components/money.blade.php) | 显示组件 |
+| [resources/assets/js/views/common/documents.js](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/views/common/documents.js) | 录单/付款前端逻辑（币种切换、付款换算、税额计算） |
+| [resources/assets/js/components/AkauntingMoney.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/components/AkauntingMoney.vue) | JS 端金额输入组件 |
+| [resources/assets/js/components/AkauntingCurrencyConversion.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/components/AkauntingCurrencyConversion.vue) | JS 端汇率换算显示组件 |
 | [resources/assets/js/plugins/money.js](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/plugins/money.js) | JS 端金额类 |
 | [resources/assets/js/plugins/currency.js](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/plugins/currency.js) | JS 端货币类 |

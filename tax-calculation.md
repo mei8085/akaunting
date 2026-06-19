@@ -598,3 +598,296 @@ $actual_price_item = $item_discounted_amount - $item_tax_total;
    最终应付 = Σ(price × qty) - Σ行折扣 - Σ全局折扣（正确基数） + Σ税费 + Σ额外费用
    不要直接依赖 document_totals 的各字段简单相加。
    ```
+
+---
+
+## 十一、代码逐行追踪：行折扣、百分比全局折扣与最终汇总扣减的完整关联
+
+> 本章用具体数值逐行追踪三段核心代码的变量变化，彻底讲清三者之间的关联与分歧。
+
+### 11.1 测试场景
+
+| 参数 | 商品 A | 商品 B |
+|------|--------|--------|
+| 单价 price | 100 | 200 |
+| 数量 quantity | 2 | 1 |
+| 行折扣 discount | 10（百分比） | 0（无） |
+| 行折扣类型 discount_type | percentage | - |
+| 全局折扣 | 5（百分比） | - |
+| 税率 | 13%（normal 普通税） | 13%（normal 普通税） |
+
+---
+
+### 11.2 第一部分：CreateDocumentItem 逐行追踪（商品 A）
+
+**代码位置**：[CreateDocumentItem.php#L29-L202](file:///d:/fz/0601-2/solo-dogfeeding/code/48-akaunting/app/Jobs/Document/CreateDocumentItem.php#L29-L202)
+
+调用参数：`price=100, quantity=2, discount=10, discount_type='percentage', global_discount=5, global_discount_type='percentage'`
+
+| 行号 | 代码 | 变量变化 | 数值结果 |
+|------|------|----------|----------|
+| L34 | `$item_amount = price × qty` | `$item_amount = 100 × 2` | **200** |
+| L36 | `$item_discounted_amount = $item_amount` | `$item_discounted_amount` 初始化 | **200** |
+| L39-L45 | 应用**行折扣**（10%） | `$item_discounted_amount -= 200 × 10%` | **180**（行折扣后） |
+| L48-L56 | 应用**全局折扣**（5%） | `$global_discount = 180 × 5% = 9`，`$item_discounted_amount -= 9` | **171**（双折扣后，仅用于计税） |
+| L60 | 三变量同步赋值 | `$actual_price_item = $item_amount = 171` | **171** |
+| L114-L126 | 计算**普通税**（13%） | `$tax_amount = 171 × 13%`，`$item_tax_total = 22.23`，`$item_amount += 22.23` | 税=**22.23**，$item_amount=**193.23** |
+| **L158-L162** | **加回全局折扣**（关键！） | `$actual_price_item += 9`，`$item_amount += 9`，`$item_discounted_amount += 9` | `$actual_price_item`=**180**，$item_amount=**202.23** |
+| L173 | 存储税额 | `$this->request['tax'] = round(22.23, 2)` | **22.23** |
+| **L176** | **存储 total 字段** | `$this->request['total'] = round($actual_price_item, 2)` | **180** |
+
+**结论**：`$document_item->total = 180` = **行折扣后金额（未扣全局折扣）**。全局折扣仅在计税瞬间扣除，税额计算完毕后立即加回。
+
+---
+
+### 11.3 第一部分续：CreateDocumentItem 逐行追踪（商品 B）
+
+调用参数：`price=200, quantity=1, discount=0, global_discount=5, global_discount_type='percentage'`
+
+| 行号 | 代码 | 变量变化 | 数值结果 |
+|------|------|----------|----------|
+| L34 | `$item_amount = 200 × 1` | `$item_amount` | **200** |
+| L36 | `$item_discounted_amount = $item_amount` | 初始化 | **200** |
+| L39-L45 | 无行折扣 | 不变 | **200** |
+| L48-L56 | 应用全局折扣（5%） | `$global_discount = 200 × 5% = 10`，`$item_discounted_amount -= 10` | **190**（仅用于计税） |
+| L60 | 三变量同步 | `$actual_price_item = $item_amount = 190` | **190** |
+| L114-L126 | 普通税 13% | `$tax_amount = 190 × 13% = 24.70`，`$item_tax_total = 24.70`，`$item_amount += 24.70` | 税=**24.70**，$item_amount=**214.70** |
+| L158-L162 | 加回全局折扣 | `$actual_price_item += 10` | **200** |
+| L176 | 存储 total | `$this->request['total'] = round(200, 2)` | **200** |
+
+**结论**：商品 B `$document_item->total = 200` = 原价（无行折扣、无全局折扣）。
+
+---
+
+### 11.4 第二部分：CreateDocumentItemsAndTotals → createItems() 逐行追踪
+
+**代码位置**：[CreateDocumentItemsAndTotals.php#L160-L263](file:///d:/fz/0601-2/solo-dogfeeding/code/48-akaunting/app/Jobs/Document/CreateDocumentItemsAndTotals.php#L160-L263)
+
+#### 循环处理商品 A
+
+| 行号 | 代码 | 变量变化 | 数值结果 |
+|------|------|----------|----------|
+| L178-L185 | 传递全局折扣（5%） | `$item['global_discount'] = 5`，type='percentage' | 直接透传百分比数值 |
+| L214 | 调用 CreateDocumentItem | 返回 `$document_item`，其 `total = 180` | - |
+| **L218** | **$item_amount 赋值** | `$item_amount = $document_item->total`（不是 `price × qty`！注释标注了这是修复改动） | **180** |
+| L222-L228 | **重算行折扣** | `$discount_amount = $item_amount(180) × 10%` | **18**（注意！前端这里是 200×10%=20，基数已不同） |
+| **L231** | **累加 sub_total** | `$sub_total += $item_amount(180)` | `$sub_total` = **180** |
+| **L232** | **累加 actual_total** | `$actual_total += $document_item->total(180)` | `$actual_total` = **180** |
+| L234 | 累加行折扣合计 | `$discount_amount_total += 18` | **18** |
+
+#### 循环处理商品 B
+
+| 行号 | 代码 | 变量变化 | 数值结果 |
+|------|------|----------|----------|
+| L218 | $item_amount = $document_item->total | - | **200** |
+| L222-L228 | 无行折扣 | $discount_amount = 0 | **0** |
+| L231 | $sub_total += 200 | `$sub_total = 180 + 200` | **380** |
+| L232 | $actual_total += 200 | `$actual_total = 180 + 200` | **380** |
+| L234 | $discount_amount_total += 0 | 行折扣合计 | **18** |
+
+#### 循环结束后（L253-L260）
+
+| 行号 | 代码 | 变量变化 | 数值结果 |
+|------|------|----------|----------|
+| **L254-L256** | **整体扣减全局折扣** | `$actual_total -= ($sub_total(380) × 5%)` = 380 - 19 | `$actual_total` = **361** |
+
+#### 返回值
+
+```php
+return [
+    $sub_total             = 380,      // 注意：不是 Σ(price×qty)=400，而是 Σ(行折扣后 total)
+    $actual_total          = 361,      // 已扣行折扣+全局折扣的净额
+    $discount_amount_total = 18,       // 行折扣合计（基数不同导致与前端 20 不同）
+    $taxes                 = [税合计 46.93]
+];
+```
+
+**关键关联**：此处 `$sub_total` 的含义已被 L218 的修改改变了。原本应该是 `Σ(price × qty) = 400`，但现在实际等于 `Σ($document_item->total) = Σ(行折扣后金额) = 380`。这就是「小计说明不一致」的根源。
+
+---
+
+### 11.5 第二部分续：CreateDocumentItemsAndTotals → handle() 逐行追踪
+
+**代码位置**：[CreateDocumentItemsAndTotals.php#L29-L158](file:///d:/fz/0601-2/solo-dogfeeding/code/48-akaunting/app/Jobs/Document/CreateDocumentItemsAndTotals.php#L29-L158)
+
+| 行号 | 代码 | 变量变化 / 入库 | 数值结果 |
+|------|------|-----------------|----------|
+| L33 | 接收 createItems 返回值 | `$sub_total=380, $actual_total=361, $discount_amount_total=18, $taxes=46.93` | - |
+| L38-L48 | 写入 `document_totals.code='sub_total'` | amount = round(380, 2) | **380**（⚠️ 含义=行折扣后合计，非原价合计） |
+| L50 | 初始化单据金额 | `$this->request['amount'] += $actual_total(361)` | amount = **361** |
+| L55-L69 | 写入 `document_totals.code='item_discount'` | amount = round(18, 2) | **18**（⚠️ 基数=行折扣后，前端基数=原价） |
+| **L71-L74** | **计算全局折扣展示额** | `$discount_total = $sub_total(380) × 5%`（L73 注释掉的旧代码才是 `($sub_total - $discount_amount_total) × 5%`） | **19** |
+| L79-L89 | 写入 `document_totals.code='discount'` | amount = round(19, 2) | **19** |
+| L95-L113 | 写入 `document_totals.code='tax'`（分税种） | `$this->request['amount'] += 22.23 + 24.70` | amount = 361 + 46.93 = **407.93** |
+| L144 | 舍入最终金额 | `$this->request['amount'] = round(407.93, 2)` | **407.93** |
+| L147-L157 | 写入 `document_totals.code='total'` | amount = 407.93 | **407.93** |
+
+**三者关联公式**：
+```
+最终总额 amount
+  = actual_total(361)           ← createItems 返回：Σ行折扣后 - 整体全局折扣
+  + Σtaxes(46.93)               ← 基于扣了全局折扣的基数计算
+  + extra(0)
+= 407.93
+```
+
+注意：`document_totals.discount = 19` 和 `document_totals.sub_total = 380` 是用于展示的中间值，**不参与**最终 amount 的计算。最终 amount 的计算完全依赖 `actual_total` 和 `taxes`。
+
+---
+
+### 11.6 第三部分：前端 documents.js 逐行追踪
+
+**代码位置**：[documents.js#L310-L393](file:///d:/fz/0601-2/solo-dogfeeding/code/48-akaunting/resources/assets/js/views/common/documents.js#L310-L393)
+
+#### calculateTotalBeforeDiscountAndTax() 预计算（L532-L567）
+
+| 商品 | item_total = price×qty | 行折扣额（基数=原价） | 行折扣后金额 |
+|------|----------------------|---------------------|-------------|
+| A | 200 | 200 × 10% = 20 | 180 |
+| B | 200 | 0 | 200 |
+| Σ | - | - | total = **380** |
+
+返回 `items_amount = [0:180, 1:200, total:380]`
+
+#### onCalculateTotal() 主计算（L310-L393）
+
+##### 处理商品 A
+
+| 行号/逻辑 | 计算 | 结果 |
+|-----------|------|------|
+| L321 | `item.total = item.grand_total = 100 × 2` | **200** |
+| L323 | `item_discounted_total = items_amount[0]` | **180**（行折扣后） |
+| L325 | `line_discount_amount = 200 - 180` | **20** |
+| L328-L335 | 应用全局折扣 5%（基数=行折扣后 180） | `total_discount += 9`，`item_discounted_total = 171` |
+| L343-L345 | `item.grand_total = 171`（双折扣后） | **171** |
+| L347 | `calculateItemTax(item, ...)`：普通税 13%，基数=171 | 税 = **22.23**，`item.grand_total += 22.23 = 193.23` |
+| L349 | `item.total = 100 × 2`（**还原为原价**） | **200** |
+| L352 | `line_item_discount_total += 20` | **20** |
+| L353 | `sub_total += 200` | **200** |
+| L354 | `grand_total += 193.23` | **193.23** |
+
+##### 处理商品 B
+
+| 逻辑 | 计算 | 结果 |
+|------|------|------|
+| item.total = 200 × 1 | - | **200** |
+| item_discounted_total = items_amount[1] | - | **200** |
+| line_discount_amount = 200 - 200 | - | **0** |
+| 全局折扣 5%（基数=200） | `total_discount += 10`，item_discounted_total = 190 | - |
+| item.grand_total = 190 | - | **190** |
+| 普通税 13%（基数=190） | 税 = 24.70，grand_total += 24.70 | **214.70** |
+| item.total 还原 | - | **200** |
+| sub_total += 200 | sub_total = 200 + 200 | **400** |
+| grand_total += 214.70 | grand_total = 193.23 + 214.70 | **407.93** |
+
+##### 前端最终结果
+
+| 字段 | 值 |
+|------|----|
+| totals.sub（小计）| **400**（= Σ原价，与后端 380 不同） |
+| totals.item_discount（行折扣合计）| **20**（基数=原价，与后端 18 不同） |
+| totals.discount（全局折扣合计）| **19**（180×5% + 200×5%，与后端 380×5%=19 碰巧一致） |
+| totals.taxes | **46.93** |
+| totals.total（最终总额）| **407.93** |
+
+---
+
+### 11.7 三者数值对比总表
+
+| 字段 | 前端预览 | 后端 document_totals | 后端实际参与总额计算 | 为何不同 |
+|------|---------|---------------------|---------------------|----------|
+| **sub_total 小计** | 400 = Σ(price×qty) | **380** = Σ(行折扣后 total) | 不参与 | L218 用 `$document_item->total` 替代了 `price×qty` |
+| **item_discount 行折扣** | 20 = Σ(原价×行折扣率) | **18** = Σ(total×行折扣率) | 不参与 | 计算基数不同 |
+| **discount 全局折扣** | 19 = Σ(行折扣后×5%) | **19** = sub_total×5% | 不参与 | 乘法分配律导致碰巧相等（180+200=380，380×5%=180×5%+200×5%） |
+| **taxes 税额** | 46.93 | 46.93 | ✅ 参与 | 计税基数一致（扣了全局折扣的金额） |
+| **total 最终总额** | 407.93 | 407.93 | ✅ | normal 税场景下碰巧一致 |
+
+> ⚠️ **注意**：全局折扣的"碰巧一致"只适用于百分比全局折扣 + normal 税的场景。如果涉及 inclusive、withholding、compound 税，或全局折扣为固定金额，则前后端总额也可能出现差异。
+
+---
+
+### 11.8 关联链路全景图
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     用户输入（前端表单）                              │
+│  price, quantity, discount(行), global_discount(整单), tax_ids      │
+└──────────────────────────────────────┬──────────────────────────────┘
+                                       │
+          ┌────────────────────────────┼────────────────────────────┐
+          ▼                            ▼                            ▼
+┌────────────────────┐      ┌────────────────────────┐     ┌──────────────────────┐
+│   前端预览计算      │      │  CreateDocumentItem    │     │ CreateDocumentItems- │
+│  (documents.js)    │      │   （每行独立调用）      │     │    AndTotals 汇总层   │
+├────────────────────┤      ├────────────────────────┤     ├──────────────────────┤
+│ sub_total =        │      │ L34: price × qty       │     │ L231: $sub_total      │
+│   Σ(price × qty)   │      │   = 原始金额           │     │   = Σ($document_item  │
+│                    │      │ L39-45: 扣行折扣       │     │     ->total)          │
+│ 行折扣基数=原价    │──┐   │ L48-56: 扣全局折扣     │     │   = Σ(行折扣后金额)   │
+│                    │  │   │   ↓ (仅用于计税！)     │     │                      │
+│ 全局折扣基数=      │  │   │ L60: actual_price_item │     │ L222-228: 重算行折扣  │
+│  行折扣后金额      │  │   │   = 双折扣后金额        │     │   基数 = total(已扣   │
+│                    │  │   │ L82-155: 按类型算税    │     │   行折扣)             │
+│                    │  │   │   (基数=双折扣后)       │     │                      │
+│ 税后 grand_total   │  │   │                        │     │ L74: discount_total   │
+│   = 双折扣后 + 税  │  │   │ L158-162: ⭐加回全局折扣│     │   = $sub_total × 折扣率│
+│                    │  │   │   (税额不受影响)        │     │   (基数=行折扣后合计) │
+│                    │  │   │                        │     │                      │
+│ 最终 total =       │  │   │ L176: total =          │     │ L256: $actual_total  │
+│  Σ(grand_total)    │  │   │   actual_price_item    │     │   -= $sub_total × 折扣│
+│                    │  │   │   = 行折扣后金额        │     │                      │
+└────────────────────┘  │   └───────────┬────────────┘     └──────────┬───────────┘
+                        │               │                             │
+                        │               ▼                             ▼
+                        │      $document_item->total       $this->request['amount']
+                        │         = 行折扣后金额            = actual_total + Σtaxes
+                        │               │                        = 407.93
+                        │               │                             │
+                        │               └──────────────┬──────────────┘
+                        │                              │
+                        │                              ▼
+                        │                    ┌──────────────────┐
+                        │                    │   最终总额对比     │
+                        │                    │ 前端: 407.93      │
+                        │                    │ 后端: 407.93      │
+                        │                    │  (本场景一致)     │
+                        │                    └──────────────────┘
+                        │
+                        └─► 中间展示字段（sub_total、item_discount、discount）
+                              前后端含义和数值不一致，但不影响最终总额
+```
+
+---
+
+### 11.9 为什么最终总额有时一致？
+
+在「百分比全局折扣 + 仅 normal 税」场景下，乘法分配律保证了总额一致：
+
+```
+前端全局折扣合计 = Σ(行折扣后 × 折扣率)
+后端全局折扣合计 = Σ(行折扣后) × 折扣率
+
+两者相等（乘法分配律），税额基数也一致（都是扣了全局折扣的金额），
+所以最终总额相同。
+```
+
+但以下场景可能出现不一致：
+1. **inclusive 税**：前端 L526-L528 有 `item.total += total_discount_amount` 的折扣回加逻辑，后端没有对应处理
+2. **固定金额全局折扣**：分摊比例在前后端可能因舍入时机不同产生尾差
+3. **compound 税**：基于已含税金额的二次计税，对舍入时机极度敏感
+4. **withholding 税**：负值税的处理顺序可能影响复合税基数
+
+---
+
+### 11.10 小结：代码理解要点
+
+1. **`$document_item->total` 不是原价**：经过 CreateDocumentItem 处理后，它等于「行折扣后金额」，不是 `price × quantity`。这是 L218 注释标记的修复改动带来的含义变化。
+
+2. **全局折扣的「两步走」设计**：
+   - 第一步：CreateDocumentItem 内部扣全局折扣 → 仅用于计算税额
+   - 第二步：税额算完后加回 → 存储的 total 不含全局折扣
+   - 第三步：汇总层 L256 整体再扣一次全局折扣 → 计入最终总额
+
+3. **document_totals 的展示值与计算值分离**：`sub_total`、`item_discount`、`discount` 存入数据库的是「展示值」，最终 `amount` 不依赖这些字段相加，而是通过 `actual_total + Σtaxes + Σextra` 独立计算。
+
+4. **前端 L349 的还原操作**：`item.total = price × qty` 把行 total 还原为原价，目的是让 `sub_total` 展示为原价合计。但后端 L218 改成了用 `$document_item->total`（行折扣后），这就是「小计说明不一致」的直接原因。

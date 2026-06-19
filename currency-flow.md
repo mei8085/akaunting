@@ -453,24 +453,205 @@ list($sub_total, $actual_total, $discount_amount_total, $taxes)
 - 千位分隔符（thousands_separator）
 - 小数位数（precision）
 
-### 6.2 JS 端格式化
+### 6.2 JS 端金额工具：币种识别与最小单位
 
-**Vue 组件**：`<akaunting-money>`
-- 组件：[resources/assets/js/components/AkauntingMoney.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/components/AkauntingMoney.vue)
-- 视图：[resources/views/components/form/input/money.blade.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/views/components/form/input/money.blade.php)
-- 核心类：[resources/assets/js/plugins/money.js](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/plugins/money.js)
+JS 端存在**两套相互独立**的金额处理体系，不可混淆：
 
-**动态响应币种切换**：
+| 体系 | 作用 | 核心文件 | 是否使用 subunit | 金额单位 |
+|------|------|----------|-----------------|----------|
+| v-money (AkauntingMoney) | 输入框显示/掩码/格式化 | [AkauntingMoney.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/components/AkauntingMoney.vue) | ❌ 不使用 | 主单位（如元） |
+| Money 类 | 汇率换算/算术运算 | [plugins/money.js](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/plugins/money.js) | ✅ 使用（getPrecision/format） | 主单位（见下方说明） |
+
+两者都依赖 [Currency 类](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/plugins/currency.js) 来读取币种属性。
+
+---
+
+#### 6.2.1 Currency 类：币种识别流程
+
+**构造入口**：`new Currency(currency_code)`
+
 ```
-watch.dynamicCurrency → this.money = {
-    decimal:   currency.decimal_mark,
-    thousands: currency.thousands_separator,
-    prefix:    symbol_first ? symbol : '',
-    suffix:    !symbol_first ? symbol : '',
-    precision: parseInt(currency.precision),
+传入 currency_code（字符串）
+  ↓
+第 1 步：规范化
+  typeof currency == String ? →  trim + toUpperCase
+  否则 → 默认 'USD'
+  ↓
+第 2 步：加载货币字典
+  this.currencies =
+    Object.keys(this.currencies).length ?
+      已设置的自定义字典  →  setCurrencies() 手动注入
+      : config['currencies']  → 从 money.json 静态导入
+  ↓
+第 3 步：校验
+  code 不在字典内 → throw "Invalid currency ..."
+  ↓
+第 4 步：挂载属性（从字典中读取）
+  name, code, rate, precision, subunit,
+  symbol, symbolFirst, decimalMark, thousandsSeparator
+```
+
+**货币配置来源**：
+- 静态导入：`import config from './../../../../public/money.json'` —— 编译时打包进 bundle
+- 动态拉取：`getConfig()` 方法通过 axios 重新请求 `public/money.json`（备用，日常使用走静态导入）
+
+**注意事项**：
+- `money.json` 同时包含法币 + 大量加密货币（BTC、ETH、USDT 等），总条目超过 150+
+- 加密货币的 rate 默认写死为 1，实际汇率需后端 currencies 表提供
+- 构造函数中 `typeof currency == String` 的写法有隐患（`String` 是构造函数，`typeof` 返回小写字符串），实际等价于判断失败走默认值 `'USD'`
+
+---
+
+#### 6.2.2 最小单位（subunit）与精度（precision）
+
+**定义**：
+- `precision`：小数位数（显示/计算精度）
+- `subunit`：最小单位与主单位的换算比率（如 1 元 = 100 分 → subunit = 100）
+
+**常规关系**（法币）：
+
+| 货币 | precision | subunit | 关系 |
+|------|-----------|---------|------|
+| USD / CNY / EUR | 2 | 100 | subunit = 10^precision ✓ |
+| JPY | 0 | 1 | subunit = 10^precision ✓ |
+| BHD（第纳尔） | 3 | 1000 | subunit = 10^precision ✓ |
+
+**异常情况**（加密货币，来自 `money.json`）：
+
+| 货币 | precision | subunit | 关系 |
+|------|-----------|---------|------|
+| BTC / ETH / USDT 等 | 4 | 100 | subunit ≠ 10^precision ✗ |
+
+> ⚠️ 加密货币的 subunit 被统一设为 100，但 precision 是 4。这意味着：
+> - 按 4 位小数显示和计算
+> - 但 getValue() 除以 subunit 只除 100，结果会比真实主单位值小 100 倍
+> - 如果使用 Money.format() 显示加密货币，金额会缩小 100 倍
+> - 实际业务中加密货币较少使用 Money.format()，主要依赖 v-money 组件显示
+
+---
+
+#### 6.2.3 Money 类内部机制
+
+**文件**：[plugins/money.js](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/plugins/money.js)
+
+**构造**：`new Money(currency_code, amount, format)`
+- `this.currency`：内部创建一个 Currency 实例
+- `this.amount`：存储金额数值（详见下方单位说明）
+- `this.format`：格式标记（未实际使用）
+
+**核心方法对照表**：
+
+| 方法 | 返回值 | 单位 | 用途 |
+|------|--------|------|------|
+| `getAmount()` | `this.amount` | 主单位 | 业务计算、汇率换算后的原始值 |
+| `getValue()` | `this.amount / subunit` | （见说明） | 为 format() 做准备 |
+| `format()` | 格式化字符串 | 显示用 | 带符号、千分位的可读字符串 |
+| `multiply(n)` | 链式 | — | 金额乘法（用于汇率换算） |
+| `divide(n)` | 链式 | — | 金额除法（用于汇率换算） |
+| `round(amount)` | 数值 | — | 按 precision 四舍五入 |
+
+**关于 amount 存储单位的澄清**：
+
+这是最容易混淆的一点。从代码调用链反推：
+
+1. **业务层调用**（documents.js 的 convertBetween）传入的是主单位金额（如付款 100.50 美元）
+2. `convert()` 方法同币种时直接返回 `money.getAmount()` = `this.amount`
+3. 返回值被 `parseFloat().toFixed(precision)` 后写回付款输入框，数值合理（如 "100.50"）
+
+→ 结论：**业务场景中，`this.amount` 存储的是主单位金额**，不是最小单位。
+
+那 `getValue()` 为什么要除以 subunit？
+
+- `getValue()` + `format()` 这一对方法遵循 Fowler 的 Money Pattern，期望 amount 是最小单位（如美分整数）
+- 但 `multiply` / `divide` 又直接对 amount 做浮点运算并按 precision round，符合主单位计算特征
+- 两套逻辑在同一个类里并存，导致**语义不统一**
+
+**实际使用建议**：
+- 汇率换算/算术运算 → 用 `getAmount()`、`multiply()`、`divide()`（主单位语义）
+- 显示格式化 → 用 `format()`（需确保 amount 是最小单位，否则结果偏差）
+- 目前业务代码（documents.js）的 convert 系列方法在 format=false 时用 getAmount，format=true 时用 format，需谨慎选择
+
+**round 方法实现细节**：
+```js
+return parseFloat(
+  (Math.round(
+    (amount * 10^precision) + (amount_sign * 0.0001)  // +0.0001 用于修正浮点误差
+  ) / 10^precision).toFixed(precision)
+);
+```
+- 按 precision 位小数做四舍五入
+- 加 0.0001 偏移量补偿 IEEE 754 浮点误差
+- 最终用 toFixed 保证小数位数
+
+---
+
+#### 6.2.4 AkauntingMoney 组件（v-money 封装）
+
+**文件**：[AkauntingMoney.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/components/AkauntingMoney.vue)
+
+这是一个对 `v-money` 库的 `<Money>` 组件封装，用于输入框的金额格式化显示。**与 Money 类无任何继承或调用关系**。
+
+**Props 中的两套币种配置**：
+
+| Prop | 含义 | 优先级 |
+|------|------|--------|
+| `currency` | 默认币种对象（初始化时使用） | 低（初始值） |
+| `dynamicCurrency` | 动态币种对象（币种切换后传入） | 高（运行时覆盖） |
+
+每个配置对象包含：
+```js
+{
+  decimal_mark: '.',           // 小数点符号
+  thousands_separator: ',',    // 千位分隔符
+  symbol_first: 1,             // 符号是否在前
+  symbol: '$',                 // 货币符号
+  precision: 2,                // 小数位数
+  code: 'USD'                  // 币种代码（用于判断是否切换）
 }
 ```
-币种切换后，无需重算数值，输入框的显示格式会自动按新币种刷新。
+
+**注意**：v-money 体系**不使用 subunit**，只使用 precision 控制小数位。金额值（v-model）始终是主单位。
+
+---
+
+#### 6.2.5 币种动态切换流程（录单页）
+
+触发：用户在总额区域选择新币种 → `onChangeCurrency(currency_code)`
+
+```
+onChangeCurrency(currency_code)
+  ↓
+第 1 步：拉取 /settings/currencies 接口（首次调用时）
+  得到公司全部币种列表（含 rate、precision、symbol 等）
+  ↓
+第 2 步：匹配并更新 currency 对象
+  this.currency = 匹配的币种对象
+  this.form.currency_code = 新 code
+  this.form.currency_rate = 新 rate
+  ↓
+第 3 步：通过 prop 传递给 AkauntingMoney
+  父组件把 currency 对象作为 dynamicCurrency 传入
+  ↓
+第 4 步：AkauntingMoney 内部 watch 响应
+  watch.dynamicCurrency → 重新组装 this.money
+    {
+      decimal:   currency.decimal_mark,
+      thousands: currency.thousands_separator,
+      prefix:    symbol_first ? symbol : '',
+      suffix:    !symbol_first ? symbol : '',
+      precision: parseInt(currency.precision),
+      masked:    this.masked
+    }
+  ↓
+第 5 步：v-money 组件自动刷新显示
+  输入框的符号、分隔符、小数位 → 按新币种渲染
+  但金额数值本身（this.model）不变
+```
+
+**关键结论**：
+- 币种切换只改**显示格式**和**回显汇率**
+- 不立即重算各行 item 金额的数值
+- 真正的币种换算是在**提交后由后端 Job** 处理的
 
 ### 6.3 输入解析（Middleware）
 
@@ -561,10 +742,12 @@ document.amount (数值，单据币种)
 document.amount (数值，单据币种)
   → convertBetween(amount, doc_currency, doc_rate,
                    default_currency, 1.0)  [汇率转换]
-    → default_amount (数值，默认货币)
-      → money(default_amount, default_currency)  [格式化]
+    → converted_to_default (数值，公司默认货币)
+      → money(converted_to_default, default_currency)  [格式化]
         → "¥8,765.43" (显示字符串)
 ```
+
+> 注意：此处变量名 `converted_to_default` 与付款流程中的 `default_amount`（**单据币种**的剩余应付回显）含义不同，请勿混淆。
 
 **场景 3：跨币种付款 → 累计已付款**
 

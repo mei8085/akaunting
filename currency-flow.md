@@ -92,12 +92,21 @@ round($this->request['amount'], $precision);
 
 ### 2.3 JS 端精度处理
 
-**存储单位**：金额以**最小单位（subunit）**存储（如美分）
+JS 端存在两套金额体系，精度处理方式不同：
 
+**体系一：v-money 输入组件（AkauntingMoney.vue）**
+- 存储单位：**主单位**（如元）
+- 精度控制：仅使用 `precision` 控制输入和显示的小数位数
+- 不使用 `subunit`，直接对主单位数值做格式化
+
+**体系二：Money 类（plugins/money.js）**
 - 文件：[resources/assets/js/plugins/money.js](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/plugins/money.js)
 - `getValue()`：`amount / subunit` 得到主单位
 - `format()`：使用 precision 控制小数位数
-- `round()`：按货币精度做四舍五入
+- `round()`：基于货币精度做四舍五入，补偿 IEEE 754 浮点误差
+- 注意：业务层调用（如 convertBetween）传入的是主单位金额，`getAmount()` 返回的也是主单位值
+
+详细说明见 [6.2 JS 端金额工具：币种识别与最小单位](#62-js-端金额工具币种识别与最小单位)
 
 ### 2.4 常见货币精度
 
@@ -470,12 +479,13 @@ JS 端存在**两套相互独立**的金额处理体系，不可混淆：
 
 **构造入口**：`new Currency(currency_code)`
 
+[source code](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/plugins/currency.js#L5-L25)
+
 ```
 传入 currency_code（字符串）
   ↓
 第 1 步：规范化
-  typeof currency == String ? →  trim + toUpperCase
-  否则 → 默认 'USD'
+  this.currency = (typeof currency == String) ? currency.trim().toUpperCase() : 'USD'
   ↓
 第 2 步：加载货币字典
   this.currencies =
@@ -495,10 +505,84 @@ JS 端存在**两套相互独立**的金额处理体系，不可混淆：
 - 静态导入：`import config from './../../../../public/money.json'` —— 编译时打包进 bundle
 - 动态拉取：`getConfig()` 方法通过 axios 重新请求 `public/money.json`（备用，日常使用走静态导入）
 
-**注意事项**：
-- `money.json` 同时包含法币 + 大量加密货币（BTC、ETH、USDT 等），总条目超过 150+
-- 加密货币的 rate 默认写死为 1，实际汇率需后端 currencies 表提供
-- 构造函数中 `typeof currency == String` 的写法有隐患（`String` 是构造函数，`typeof` 返回小写字符串），实际等价于判断失败走默认值 `'USD'`
+---
+
+**🔴 Bug 1：`typeof currency == String` 导致币种识别永远失败**
+
+[currency.js#L7](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/plugins/currency.js#L7)：
+```js
+this.currency = (typeof currency == String) ? currency.trim().toUpperCase() : 'USD';
+```
+
+**问题**：JavaScript 中 `typeof` 始终返回**小写字符串**（`"string"`、`"number"`、`"object"` 等），而 `String`（大写 S）是构造函数对象。比较 `"string" == function String() { ... }` 永远为 `false`。
+
+**后果**：无论传入什么 `currency_code`，`this.currency` **永远被设为 `'USD'`**。
+
+**影响链路**：Currency 构造后用 `this.currency` 作为 key 去 `money.json` 字典中查找属性。因此：
+
+```
+new Currency('CNY')
+  → typeof 'CNY' == String → false
+  → this.currency = 'USD'
+  → 从 money.json 查 USD 的属性
+  → this.precision = 2, this.subunit = 100, this.symbol = '$', this.rate = 1
+  → ❌ 所有属性都是 USD 的，而非 CNY 的
+```
+
+**对非 USD 付款换算的影响**：
+
+在 [documents.js convert()](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/views/common/documents.js#L244-L261) 中：
+
+```js
+convert(method, amount, from, to, rate, format) {
+    let money = new Money(to, amount, format);
+    // Money 构造器内部: this.currency = new Currency(to)
+    // 由于 typeof bug, Currency(to) 始终构造 USD
+    // → money.currency.getPrecision() 始终返回 2
+    // → money.currency.getSubunit() 始终返回 100
+    // → money.currency.getSymbol() 始终返回 '$'
+    ...
+    money = money[method](parseFloat(rate));  // multiply 或 divide
+    // round() 内部用 this.currency.getPrecision() = 2
+    return format ? money.format() : money.getAmount();
+}
+```
+
+具体影响分三层：
+
+| 影响层 | 现象 | 严重度 |
+|--------|------|--------|
+| **round 精度** | `round()` 始终按 USD 的 precision=2 做四舍五入，而非目标币种精度 | 中（见下方分析） |
+| **format 格式** | `format()` 使用 USD 的符号 `$`、小数点 `.`、千分位 `,`，而非目标币种的格式 | 高（但 format=true 在当前业务代码中未使用） |
+| **getValue 计算** | `getValue()` 除以 USD 的 subunit=100，而非目标币种的 subunit | 高（但 getValue 只被 format 调用，format 未被业务使用） |
+
+**round 精度的实际影响分析**：
+
+在 `convertBetween` → `convert` → `multiply`/`divide` → `round` 的链路中，round 始终按 precision=2 截断。但调用方（documents.js）在拿到结果后，还会再包一层 `parseFloat(converted_amount).toFixed(实际币种精度)`：
+
+```js
+// onChangeCurrencyPaymentAccount
+let converted_amount = this.convertBetween(amount, code, rate, ...);
+amount = parseFloat(converted_amount).toFixed(precision);  // precision 来自 this.currency.precision
+```
+
+这导致了**双重舍入**：
+
+| 币种 | 内层 round（Money.round） | 外层 toFixed（业务代码） | 结果 |
+|------|---------------------------|--------------------------|------|
+| USD (precision=2) | round 到 2 位 | toFixed(2) | ✅ 无损 |
+| JPY (precision=0) | round 到 2 位（多保留） | toFixed(0) 截断 | ⚠️ 第 3 位及以后四舍五入差异可能被抹掉，但差异极小 |
+| BHD (precision=3) | round 到 2 位（**截断第 3 位**） | toFixed(3) 补零 | ❌ 第 3 位小数精度**永久丢失**，无法被外层 toFixed 恢复 |
+
+**示例**：BHD 汇率换算
+```
+原始计算结果: 123.4567 BHD
+内层 round(2): 123.46     ← 第3位 6 被保留但 7 被截断
+外层 toFixed(3): 123.460  ← 第3位补0，原始 6 永远丢失
+正确结果应为:  123.457    ← round(3) 应得到 457
+```
+
+> **结论**：对于 precision > 2 的币种（BHD、IQD、KWD、JOD、TND 等），前端换算会产生不可逆的精度丢失。precision ≤ 2 的币种不受影响。
 
 ---
 

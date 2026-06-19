@@ -370,9 +370,70 @@ Route::signed('offline-payments', function () {
 | 支付模块动态生成回调 URL | [PaymentController.php#L155-L160](app/Abstracts/Http/PaymentController.php#L155-L160) | `signed.{alias}.invoices.{suffix}`（confirm/return/cancel/finish 四种走 signed） |
 | 支付模块异步通知地址 | [PaymentController.php#L150-L153](app/Abstracts/Http/PaymentController.php#L150-L153) | `portal.{alias}.invoices.notify`（**不走 signed，详见下文**） |
 
+##### 路由宏与中间件组对应关系
+
+在 [Route.php](app/Providers/Route.php) 中定义了 4 个路由宏，每个宏对应一套中间件组，决定了路由的用户态访问限制：
+
+| 路由宏 | 中间件组 | auth 认证 | session | csrf | URL 签名 | 权限检查 | 适用场景 |
+|--------|---------|----------|---------|------|---------|---------|---------|
+| `Route::signed()` | `signed` | ❌ 无 | ✅ 有 | ✅ 有 | ✅ `signature` 中间件 | ❌ 无 | 访客通过签名链接访问（邮件链接） |
+| `Route::portal()` | `portal` | ✅ `auth` 中间件 | ✅ 有 | ✅ 有 | ❌ 无 | ✅ `read-client-portal` | 登录客户在客户门户操作 |
+| `Route::admin()` | `admin` | ✅ `auth` 中间件 | ✅ 有 | ✅ 有 | ❌ 无 | ✅ `read-admin-panel` | 管理员在后台操作 |
+| `Route::api()` | `api` | ✅ 动态认证（Bearer/Basic） | ❌ 无 | ❌ 无 | ❌ 无 | ✅ `read-api` | API 集成调用 |
+
+中间件组完整定义见 [Kernel.php#L32-L135](app/Http/Kernel.php#L32-L135)。
+
+> **宏的可覆盖性**：所有路由宏的第三个参数 `$attributes` 可以覆盖默认配置（如 middleware、prefix、namespace 等）。模块可以对单条路由单独调整中间件，例如去掉 notify 路由的 `auth` 限制。
+
+##### 签名校验机制（ValidateSignature 自定义实现）
+
+Akaunting 没有直接用 Laravel 原生的 `ValidateSignature`，而是自己重写了一个，见 [ValidateSignature.php](app/Http/Middleware/ValidateSignature.php)。
+
+**核心差异**：
+```php
+public function hasCorrectSignature(Request $request, $absolute = true)
+{
+    $url = $absolute ? $request->url() : '/' . $request->path();
+
+    $original = rtrim($url . '?' . Arr::query(
+        Arr::only($request->query(), ['company_id'])   // ← 只参与 company_id
+    ) . Arr::query(
+        Arr::only($request->query(), ['expires'])      // ← 只参与 expires
+    ), '?');
+
+    $signature = hash_hmac('sha256', $original, config('app.key'));
+
+    return hash_equals($signature, (string) $request->query('signature', ''));
+}
+```
+
+**两个设计要点**：
+1. **只对 `company_id` 和 `expires` 两个参数签名**，其他 query 参数不影响签名验证（支付模块可以自由传额外参数）
+2. **无 `expires` 参数时永久有效**（`signatureHasNotExpired()` 中 `expires === null` 返回 true），为分享发票链接设计
+
+---
+
 ##### confirm/return/cancel/finish 走 signed URL，notify 为什么单独生成？
 
-`getNotifyUrl()` 的实现（[PaymentController.php#L150-L153](app/Abstracts/Http/PaymentController.php#L150-L153)）：
+`getModuleUrl()` 是通用方法，会根据当前请求环境自动选择 signed 或 portal 路由（见 [PaymentController.php#L155-L160](app/Abstracts/Http/PaymentController.php#L155-L160)）：
+```php
+public function getModuleUrl($invoice, $suffix)
+{
+    return request()->isPortal($invoice->company_id)
+            ? route('portal.' . $this->alias . '.invoices.' . $suffix, $invoice->id)
+            : URL::signedRoute('signed.' . $this->alias . '.invoices.' . $suffix, [$invoice->id]);
+}
+```
+
+`isPortal()` 的判断逻辑（[Macro.php#L70-L72](app/Providers/Macro.php#L70-L72)）：
+```php
+Request::macro('isPortal', function ($company_id) {
+    return $this->is($company_id . '/portal') || $this->is($company_id . '/portal/*');
+});
+```
+通过 URL 路径前缀判断，不是通过登录态判断。
+
+`getNotifyUrl()` 则**完全独立实现**，不走 `getModuleUrl` 分支（见 [PaymentController.php#L150-L153](app/Abstracts/Http/PaymentController.php#L150-L153)）：
 ```php
 public function getNotifyUrl($invoice)
 {
@@ -380,14 +441,41 @@ public function getNotifyUrl($invoice)
 }
 ```
 
-**notify 不走 signed URL 的 4 个原因**：
+**为什么 notify 不能走 signed URL？**
 
-| 原因 | 说明 |
-|------|------|
-| **调用方不同** | notify 是**第三方支付平台服务器**主动回调（webhook/IPN），不是用户浏览器访问；signed URL 是给人用的 |
-| **认证方式不同** | 第三方支付平台用**自己的签名机制**（如 HMAC、RSA 等）验证回调合法性，不识别 Laravel 的 `signature` 参数 |
-| **请求方法不同** | signed URL 通过 GET 请求验证 signature；notify 是 **POST 请求**，支付平台把交易数据放在 POST body 里 |
-| **会话无关** | notify 是服务器到服务器的调用，不需要 session、不需要用户态；signed URL 中间件可能带有 session 依赖 |
+| 原因 | signed 中间件限制 | notify 实际情况 |
+|------|-----------------|---------------|
+| **CSRF 令牌冲突** | `signed` 中间件组包含 `csrf`（[Kernel.php#L128](app/Http/Kernel.php#L128)），POST 请求必须带 `_token` | 第三方支付平台的 webhook 是纯 POST，不带 Laravel 的 CSRF token → 会被 `VerifyCsrfToken` 拦截 |
+| **签名机制不兼容** | `signed` 中间件用 `signature` query 参数验证，密钥是 `app.key` | 第三方支付平台用自己的签名（HMAC/RSA 等），不认 Laravel 的 `signature` 参数 |
+| **请求方法不匹配** | signed URL 设计为 GET 访问（signature 在 query 里） | notify 是 POST，交易数据在 body 里 |
+| **会话无意义** | `signed` 组有 `session.start`（[Kernel.php#L126](app/Http/Kernel.php#L126)） | 服务器到服务器调用，没有浏览器，session 毫无意义 |
+
+**那为什么用 `portal.` 前缀（不是 `signed.` 也不是 `api.`）？**
+
+这是一个**命名约定+默认实现**，不是强制要求：
+1. **基类只是提供默认模板**：`PaymentController` 是抽象类，`getNotifyUrl()` 是默认实现，各支付模块可以完全覆盖这个方法
+2. **模块可以调整中间件**：通过 `Route::portal()` 的第三个参数 `$attributes`，模块可以把 notify 路由的 middleware 改成 `api` 或自定义，去掉 `auth` 和 `csrf`
+3. **命名一致性**：`portal.` 前缀只是表示"对外暴露的客户侧路由"，不代表必须走 portal 中间件
+
+> ⚠️ **核心包内没有现成的支付模块实现**（`extends PaymentController` 搜索结果为 0）。`getNotifyUrl()` 的默认实现更像是一个"参考模板"，实际接入的支付模块需要根据自身需求调整路由中间件和 URL 生成逻辑。
+
+##### 扩展约定 vs 现成模块
+
+Akaunting 的支付系统是**纯插件化架构**，核心代码只提供骨架和扩展约定，不包含任何具体支付渠道的实现：
+
+| 类别 | 具体内容 | 位置 | 性质 |
+|------|---------|------|------|
+| **抽象基类** | `PaymentController` 抽象类，定义了 show/confirm/return/cancel/notify/finish 等方法模板 | [PaymentController.php](app/Abstracts/Http/PaymentController.php) | 扩展约定（必须继承） |
+| **路由宏** | `Route::signed()` / `Route::portal()` / `Route::admin()` / `Route::api()` | [Route.php#L75-L113](app/Providers/Route.php#L75-L113) | 扩展约定（推荐使用） |
+| **事件收集** | `PaymentMethodShowing` 事件，通过事件收集已安装的支付模块 | `PaymentMethodShowing` 事件 | 扩展约定（注册方式） |
+| **核心路由占位** | `signed.invoices.payment` / `signed.invoices.confirm` | [routes/signed.php#L15-L16](routes/signed.php#L15-L16) | 扩展约定（预留入口，方法不存在） |
+| **现成支付模块** | PayPal / Stripe / Offline Payments 等 | ❌ 核心包内不存在 | 需要额外安装模块 |
+
+如果要开发一个新的支付模块，需要做以下事情（这是**约定**，不是现成功能）：
+1. 新建模块目录，创建控制器继承 `PaymentController` 抽象类
+2. 在模块的 `Routes/signed.php` 和 `Routes/portal.php` 中用路由宏注册路由
+3. 监听 `PaymentMethodShowing` 事件，把自己注册到支付方法列表中
+4. 根据需要覆盖 `getNotifyUrl()` 等方法，调整 notify 路由的中间件
 
 ---
 

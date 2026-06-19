@@ -173,45 +173,66 @@ round($this->request['amount'], $precision);
 - 控制器：[app/Http/Controllers/Modals/DocumentTransactions.php](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/app/Http/Controllers/Modals/DocumentTransactions.php)
 - 逻辑：[resources/assets/js/views/common/documents.js](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/views/common/documents.js)
 
-### 4.2 模态框中的隐藏字段
+### 4.2 模态框中的基准字段
 
-付款模态框在渲染时，会注入以下隐藏字段作为换算基准：
+付款模态框在渲染时，会注入以下字段作为换算基准（关键币种修正：均以**单据币种**为基准，而非公司默认币种）：
 
-| 字段 | 含义 | 来源 |
-|------|------|------|
-| `document_currency_code` | 单据币种 | `$document->currency_code` |
-| `document_currency_rate` | 单据创建时的汇率 | `$document->currency_rate` |
-| `document_default_amount` | 单据总额（按默认货币） | `$document->grand_total` |
-| `company_currency_code` | 公司默认币种 | `default_currency()` |
-| `paid_amount` | 已付款金额（单据币种） | `$document->paid` |
+| 字段 | 含义 | 币种 | 来源 |
+|------|------|------|------|
+| `document_currency_code` | 单据币种代码 | — | `$document->currency_code` |
+| `document_currency_rate` | 单据创建时的汇率快照 | — | `$document->currency_rate` |
+| `document_default_amount` | **剩余应付金额**（总额 − 已付款） | **单据币种** | 控制器中 `round($d_total − $paid, $currency->precision)`，`$currency` 是**单据币种对象**（[DocumentTransactions.php#L60-L68](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/app/Http/Controllers/Modals/DocumentTransactions.php#L60-L68)） |
+| `company_currency_code` | 公司默认币种代码 | — | `default_currency()` |
+| `paid_amount` | 累计已付款 | 单据币种 | `$document->paid`（由 `getPaidAttribute()` 换算到单据币种） |
+| `amount` | 付款输入框初始值 | 单据币种 | 同 `document_default_amount` |
+| `default_amount`（回显字段） | 校验用的应付金额回显 | **单据币种** | `<x-form.input.money>` 的 `:currency="$currency"` 绑定的是单据币种对象（[payment.blade.php#L100-L110](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/views/modals/documents/payment.blade.php#L100-L110)） |
 
-### 4.3 付款账户切换后的金额换算
+> **命名提醒**：字段名中的 `default` 不是"默认货币"，而是指"单据本身的（基准）金额"。
+
+### 4.3 付款账户切换后的校验（先换算回单据币种再比较）
 
 触发方法：[onChangeCurrencyPaymentAccount(currency_code)](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/views/common/documents.js#L120-L153)
 
-当用户选择付款账户（即切换付款币种 `form.currency_code`）时：
+当用户选择付款账户（即切换到新的付款币种 `code` = `currency_code`）时，**校验始终在单据币种层面进行**：
 
 ```
-  付款币种 == 单据币种？
-    ├─ 是 → 无需换算，直接使用 form.amount
-    └─ 否 → 执行 convertBetween：
-              将 form.amount（原付款币种金额）
-              → 换算为新的付款币种金额
-                （按 form.currency_rate 作为新币种汇率）
-              ↓
-              然后做溢出检查：
-                如果换算后金额 > 单据总额，则自动调整为
-                「单据总额反向换算到付款币种」的值
+  新付款币种 == 单据币种？
+    ├─ 是 → 无需换算，直接通过
+    └─ 否 → Step 1：换算到单据币种做校验
+              ┌────────────────────────────────────────────┐
+              │  convertBetween(                           │
+              │    form.amount,                            │ ← 用户输入的金额
+              │    新币种code, 新rate,                      │ ← 视为：源币种 = 新付款账户
+              │    单据币种code, 单据rate)                  │ ← 目标币种 = 单据币种
+              │  → 得到【单据币种】的 equivalent_amount     │
+              └────────────────────────────────────────────┘
+                                 ↓
+           Step 2：单据币种 vs 单据币种 做比较
+              equivalent_amount  >  document_default_amount？
+                                 ↓
+           Step 3：若溢出 → 反向换算回新付款币种写入
+              ┌────────────────────────────────────────────┐
+              │  convertBetween(                           │
+              │    document_default_amount,                │ ← 剩余应付（单据币种）
+              │    单据币种code, 单据rate,                   │ ← 源币种 = 单据币种
+              │    新币种code, 新rate)                       │ ← 目标币种 = 新付款账户
+              │  → 得到【新付款币种】的上限值 error_amount    │
+              └────────────────────────────────────────────┘
+                                 ↓
+           Step 4：form.amount = error_amount（截断到付款币种上限）
+                    form.default_amount = document_default_amount（单据币种回显不变）
 ```
 
 ### 4.4 付款金额变化时的双向校验
 
 触发方法：[onChangeAmount(amount)](file:///d:/fz/0601-2/solo-dogfeeding/code/46-akaunting/resources/assets/js/views/common/documents.js#L155-L189)
 
-用户在付款输入框输入金额后：
-1. 将输入的**付款币种金额** → 通过 `convertBetween` 换算为**单据币种金额**
-2. 将换算结果写入 `form.default_amount`（作为换算回显）
-3. 如果换算后超过了 `document_default_amount`，提示并自动截断
+用户在付款输入框输入金额后（`amount` 是付款币种数值），流程与切换账户一致：
+
+1. **先换算回单据币种**：`convertBetween(amount, 付款币种, 付款汇率, 单据币种, 单据汇率)`
+2. **单据币种内比较**：换算结果 vs `document_default_amount`
+3. **写回单据币种回显**：`form.default_amount = 换算后的单据币种金额`（用户可见的左侧回显）
+4. **若溢出**：反向换算回付款币种 → `error_amount` 用于截断（但当前方法中仅更新 `default_amount`，实际截断由提交前的 `checkAmount()` 处理）
 
 ### 4.5 汇率手动变更 & "全额付款"
 

@@ -103,17 +103,57 @@ TransactionCreated Event 触发
 
 方法 `createRecurring($request)` 从请求中提取定期参数，向 `recurring` 表插入一条记录：
 
+#### 3.3.1 frequency 与 interval 的 custom 分支存值规则（★修正）
+
+```php
+// frequency 规则
+$frequency = ($request['recurring_frequency'] != 'custom')
+    ? $request['recurring_frequency']
+    : $request['recurring_custom_frequency'];
+
+// interval 规则
+$interval = (($request['recurring_frequency'] != 'custom') || ($request['recurring_interval'] < 1))
+    ? 1
+    : (int) $request['recurring_interval'];
+```
+
+| recurring_frequency 取值 | frequency 存值来源 | interval 取值 |
+|---------------------------|-------------------|---------------|
+| `no` | — (不创建 recurring) | — |
+| `daily` / `weekly` / `monthly` / `yearly` | 直接取 `recurring_frequency` (原值) | **强制=1**（忽略用户输入） |
+| `custom` | 取 `recurring_custom_frequency` (用户自定义频率字符串) | `recurring_interval >= 1` 时用用户值，否则兜底=1 |
+
+> **关键理解修正**：interval 字段**仅在 custom 分支下才允许用户自定义间隔数**。非 custom 的 daily/weekly/monthly/yearly 四种内置频率无论用户填什么 interval，数据库里一律存 `1`。即内置频率本身语义就是"每隔 1 天/周/月/年"。
+
+#### 3.3.2 created_from 与 created_by 的落库规则（★补充）
+
+```php
+$source = !empty($request['created_from']) ? $request['created_from'] : source_name();
+$owner  = !empty($request['created_by'])   ? $request['created_by']   : user_id();
+```
+
+| 字段 | 优先级1 (请求传入) | 优先级2 (兜底) | 说明 |
+|------|--------------------|----------------|------|
+| `created_from` | `$request['created_from']` | `source_name()` | [helpers.php](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Utilities/helpers.php#L150-L155) `source_name()` 内部使用 `Traits\Sources::getSourceName()`，根据请求上下文返回 `web` / `api` / `cli` 等来源标识 |
+| `created_by` | `$request['created_by']` | `user_id()` | [helpers.php](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Utilities/helpers.php#L30-L33) `user_id()` = `user()?->id`，即当前登录用户ID（CLI/无用户上下文时为 null） |
+
+> 注意：[updateRecurring()](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Traits/Recurring.php#L45-L91) 中，`update` 分支**不修改** created_from/created_by；只有 `create` 分支（原 recurring 不存在需新建时）才会写入。
+
+#### 3.3.3 完整字段说明表
+
 | 字段 | 说明 | 来源 |
 |------|------|------|
 | `company_id` | 公司ID | $this->company_id |
-| `frequency` | 频率 (daily/weekly/monthly/yearly/custom) | recurring_frequency / recurring_custom_frequency |
-| `interval` | 间隔周期 (数字) | recurring_interval，默认 1 |
+| `frequency` | 频率字符串 | 见 3.3.1 custom 分支规则 |
+| `interval` | 间隔周期 | 见 3.3.1 custom 分支规则（非custom恒为1） |
 | `started_at` | 开始日期 | recurring_started_at，默认今天 |
 | `status` | 状态 | recurring_status，默认 active |
 | `limit_by` | 限制方式 (count/date) | recurring_limit，默认 count |
 | `limit_count` | 限制次数 | recurring_limit_count，默认 0 (无限) |
 | `limit_date` | 限制截止日期 | recurring_limit_date |
 | `auto_send` | 是否自动发送邮件 | recurring_send_email，默认 0 |
+| `created_from` | 创建来源 | 见 3.3.2 request → source_name() 兜底 |
+| `created_by` | 创建人 | 见 3.3.2 request → user_id() 兜底 |
 
 ### 3.4 模板识别：isRecurring 作用域
 
@@ -205,7 +245,32 @@ getRemainingSchedules($template, $recur)
 返回 RecurrenceCollection (剩余待生成)
 ```
 
-关键点：**生成过的单据通过 `parent_id` 与模板关联**，用日期去重来保证不重复生成。
+#### 4.3.1 日期去重 + 缺行隐式重试机制（★补充）
+
+源码第 126 行的注释已经点明设计意图：
+```php
+// Get the remaining schedules, including the previously failed ones
+$schedules = $this->getRemainingSchedules($template, $recur);
+```
+
+**去重的实现本质**：不是用"已生成次数计数器"或"指针位"，而是**每次调度时实时查询子表中 parent_id = 模板id 的所有日期，再从完整日程集合中做集合差集**。
+
+**隐式重试的推导**：
+
+```
+场景：某月的 3 日、4 日两个 schedule 到期，
+      3日生成成功（documents表有一条 parent_id=X, issued_at=3日 的行），
+      4日生成时 getDocumentModel 抛出异常被 catch，事务回滚，
+      即 documents 表中没有 issued_at=4日 的子记录。
+
+下一次调度执行时：
+    已生成日期数组 = [ "3日" ]
+    完整日程仍包含 [ "3日", "4日", ... ]
+    filter 后 剩余日程 = [ "4日", ... ]
+    → 4日被自动"补单"，无需人工干预
+```
+
+> **设计优点**：无需持久化"失败队列"或"重试状态"。利用"日期集合差集"的天然幂等性，任何中断（异常、进程被杀、超时）都会在下次调度时自动补完所有"缺行"日期。代价：每次调度都要查子表日期，O(n) 去重。
 
 ### 4.4 日程生成引擎：getRecurringSchedule()
 
@@ -222,6 +287,7 @@ getRecurringSchedule()
     ↓
 ② 构建 Recurr\Rule：
    - setStartDate(started_at)
+   - setTimezone(timezone)     → ★ 公司时区
    - setFreq(frequency)        → WEEKLY/MONTHLY/...
    - setInterval(interval)     → 间隔数
    - 若 limit_by=date → setUntil(limit_date)
@@ -229,6 +295,53 @@ getRecurringSchedule()
     ↓
 ③ ArrayTransformer::transform($rule)  → RecurrenceCollection
 ```
+
+#### 4.4.1 setTimezone 调用的作用（★补充）
+
+**Trait**：[Traits/Recurring.php](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Traits/Recurring.php#L105-L151)
+
+```php
+// 构建 Rule 时显式设置时区
+$rule = (new Rule())
+    ->setStartDate($this->getRecurringRuleStartDate())
+    ->setTimezone($this->getRecurringRuleTimeZone())  // ← 关键调用
+    ->setFreq(...)
+    ->setInterval(...);
+
+// 而 StartDate/UntilDate 构造时也带着时区创建
+public function getRecurringRuleDate($date)
+{
+    return new \DateTime($date, new \DateTimeZone($this->getRecurringRuleTimeZone()));
+}
+
+// 时区来源：公司级本地化配置（非 app.timezone）
+public function getRecurringRuleTimeZone()
+{
+    return setting('localisation.timezone');
+}
+```
+
+**为什么两处都设置时区？**
+- `new \DateTime($date, $tz)` 保证输入的 started_at / limit_date 字符串**按公司时区解释**（例：输入"2026-06-21"在 Asia/Shanghai 时区下解析为东八区零点）
+- `$rule->setTimezone($tz)` 告诉 Recurr 库在**内部做日期加法运算时**使用该时区（关键：处理 DST 夏令时跳变、跨月边界计算）
+
+**不设置的风险**：如果服务器默认时区（UTC）与公司时区（如 Asia/Shanghai）相差 8 小时，可能出现"1月31日 加1月"的边界运算被错位，导致生成的日期偏移 1 天。
+
+#### 4.4.2 VirtualLimit 的兜底动机（★补充）
+
+**Trait**：[Traits/Recurring.php](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Traits/Recurring.php#L168-L187)
+
+| frequency | VirtualLimit | 对应时间跨度 |
+|-----------|-------------|-------------|
+| `yearly` | `2` | ≈ 2 年 |
+| `monthly` | `24` | ≈ 2 年 |
+| `weekly` | `104` | ≈ 2 年（104/52=2） |
+| `daily` / 其他 | `732` | ≈ 2 年（732/366≈2） |
+
+**兜底动机**：
+- 当 `limit_count = 0`（代表"无限次"）或 `limit_date` 设置得极远（如 2099年），Recurr 库若不加限制会尝试一次性展开数千乃至数万条 Recurrence 对象，导致**内存溢出 / PHP 执行超时**。
+- VirtualLimit 提供了一个**硬上界软约束**：无论业务上设置多远，每次最多向前展开"约2年"的日程集合。
+- 配合每日调度：2年跨度足够覆盖所有"历史欠账补单"场景（实际只需补到今天），同时后续日期随着每日调度逐批展开即可，不是一次性展开到无穷。
 
 ---
 
@@ -362,16 +475,16 @@ public function updateRelationTypes($model, $relations)
 | company_id | FK | 所属公司 |
 | recurable_id | FK | 多态关联ID (documents.id 或 transactions.id) |
 | recurable_type | string | 多态关联类型 (Document/Transaction 类名) |
-| frequency | string | 频率：daily/weekly/monthly/yearly/custom |
-| interval | int | 间隔周期 |
+| frequency | string | 频率：daily/weekly/monthly/yearly + custom分支自定义字符串 |
+| interval | int | 间隔周期（非custom恒为1，custom分支才会>1） |
 | started_at | datetime | 开始日期 |
 | status | string | active/ended/completed |
 | limit_by | string | count(按次数) / date(按日期) |
 | limit_count | int | 限制次数，0=无限 |
 | limit_date | datetime | 限制截止日期 |
-| auto_send | bool | 是否自动发送邮件 |
-| created_from | string | 创建来源 |
-| created_by | FK | 创建人 |
+| auto_send | bool | 是否自动发送邮件（控制通知 gate2） |
+| created_from | string | 创建来源（request[created_from] 或 source_name() 兜底） |
+| created_by | FK | 创建人（request[created_by] 或 user_id() 兜底） |
 
 ### 6.2 documents 表（单据主表）
 
@@ -411,27 +524,100 @@ public function updateRelationTypes($model, $relations)
 | TransactionCreated | IncreaseNextTransactionNumber |
 | TransactionRecurring | (无默认监听) |
 
-### 7.2 DocumentRecurring 通知发送
+### 7.2 DocumentRecurring 通知发送：三层 Gate + 配置驱动（★大幅修正补充）
 
 **监听器**：[SendDocumentRecurringNotification.php](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Listeners/Document/SendDocumentRecurringNotification.php#L19-L57)
 
 ```
 handle(DocumentRecurring $event)
-    ↓
-① 获取配置：config('type.document.{type}.notification')
-    ↓
-② 若 auto_send == false → 跳过（检查父模板的 recurring->auto_send）
-    ↓
-③ 通知客户：
-   $document->contact->notify(new Notification($document, "type_recur_customer", attach_pdf=true))
-    ↓
-④ 触发 DocumentSent 事件 → MarkDocumentSent (将 status 设为 sent)
-    ↓
-⑤ 通知公司内有 read-notifications 权限的所有用户：
-   $user->notify(new Notification($document, "type_recur_admin"))
+    │
+    ▼
+┌─ Gate 1 ─ 配置层 ─────────────────────────────────────────┐
+│ $config = config('type.document.{type}.notification')     │
+│ if (empty($config) || empty($config['class'])) return;    │
+│ 含义：该单据类型(如invoice/bill)未配置通知类则直接跳过     │
+└───────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─ Gate 2 ─ 业务开关层 ─────────────────────────────────────────┐
+│ if ($document->parent?->recurring?->auto_send == false) return;│
+│ 含义：用户在 recurring 模板上关闭了 auto_send 开关则跳过       │
+│ 注意：用 nullsafe ?-> 操作符，parent/recurring 缺失时不报错    │
+└───────────────────────────────────────────────────────────────┘
+    │
+    ├──┐
+    │  │
+    │  ▼
+    │ ┌─ Gate 3a ─ 客户可达性(内部4层) ───────────────────────┐
+    │ │ $this->canNotifyTheContactOfDocument($document)      │
+    │ │   内部判断:                                            │
+    │ │   ① config.notify_contact == true ?                   │
+    │ │   ② contact 存在 && contact->enabled == 1 ?           │
+    │ │   ③ !empty(contact_email) ?                           │
+    │ │   ④ EmailValidator(RFC + DNS MX 记录校验) 通过 ?       │
+    │ │ 以上全部满足才发送客户通知                              │
+    │ └───────────────────────────────────────────────────────┘
+    │      │
+    │      ▼ 全部通过
+    │   通知客户（带PDF附件）：
+    │   $contact->notify(new InvoiceNotification, "invoice_recur_customer", true)
+    │
+    ▼
+┌─ ★ sent 事件触发点（配置驱动）────────────────────────────────┐
+│ $sent = config('type.document.{type}.auto_send',              │
+│               DocumentSent::class);                            │
+│ event(new $sent($document));                                   │
+│ 含义：用哪个事件类来标记"已发送/已收到"状态完全由配置决定       │
+└───────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─ Gate 3b ─ 用户通知总开关 ───────────────────────────────────┐
+│ if (!$config['notify_user']) return;                          │
+│ 含义：配置里关闭了 notify_user 则在此处 return                 │
+│ ★注意：sent 事件已经触发了，单据状态已改为 sent/received      │
+└───────────────────────────────────────────────────────────────┘
+    │
+    ▼
+遍历公司所有用户：
+    │
+    ▼
+┌─ Gate 3c ─ 用户权限层(循环内continue) ─────────────────────┐
+│ if ($user->cannot('read-notifications')) continue;          │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼ 通过
+通知用户（无PDF）：
+$user->notify(new InvoiceNotification, "invoice_recur_admin")
 ```
 
-关键点：生成的 recurring 子单据会自动被标记为 **已发送 (sent)** 状态。
+#### 7.2.1 三层 Gate 汇总
+
+| Gate 编号 | 层级 | 检查内容 | 失败动作 | 代码位置 |
+|-----------|------|---------|---------|---------|
+| Gate 1 | 配置层 | 该 type 的 notification 配置是否存在 class | `return` | Line 24-26 |
+| Gate 2 | 业务层 | 模板 recurring.auto_send 是否开启 | `return` | Line 28-30 |
+| Gate 3a | 客户可达性 | notify_contact开关+contact启用+有邮箱+邮箱合法（RFC+DNS） | 不通知客户，**继续往下走** | 方法内 return false |
+| Gate 3b | 用户通知开关 | config.notify_user == true | `return` | Line 45-47 |
+| Gate 3c | 用户权限 | 用户有 `read-notifications` 权限 | `continue` 单用户 | Line 51-53 |
+
+> 关键点：Gate 3a 失败只是不通知客户，但 sent 事件和用户通知逻辑仍会继续执行（除非 Gate 3b 总开关关闭）。
+
+#### 7.2.2 配置驱动的 sent 事件类（★补充）
+
+**配置文件**：[type.php](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/config/type.php)
+
+监听器代码：
+```php
+$sent = config('type.document.' . $document->type . '.auto_send', DocumentSent::class);
+event(new $sent($document));
+```
+
+| 子单据 type | 配置里的 auto_send 值 | 对应事件类 | 触发的监听者动作 |
+|------------|----------------------|-----------|----------------|
+| `invoice` | `App\Events\Document\DocumentSent` | `DocumentSent` | `MarkDocumentSent` → status = `sent` |
+| `bill` | `App\Events\Document\DocumentReceived` | `DocumentReceived` | `MarkDocumentReceived` → status = `received` |
+
+> **设计含义**：发票(invoice)是"我方发给客户"→ 状态流转为 `sent`；账单(bill)是"我方从供应商收到"→ 状态流转为 `received`。两种单据的业务语义相反，因此触发不同的 sent/received 事件，由配置决定而非硬编码。
 
 ---
 
@@ -459,8 +645,12 @@ RecurringCheck::handle()
     │       ├─► getRemainingSchedules():
     │       │     │
     │       │     ├─► 查 documents 表，parent_id = 模板id 的所有 issued_at
+    │       │     │   (日期差集去重 + 缺行隐式重试)
     │       │     │
-    │       │     └─► getRecurringSchedule() → 用 Recurr 库生成完整日程 → 过滤掉已生成
+    │       │     └─► getRecurringSchedule()
+    │       │           ├─ setTimezone(公司本地化时区)
+    │       │           ├─ setVirtualLimit(~2年软上限)
+    │       │           └─ Recurr 展开 → 过滤已生成日期
     │       │
     │       ├─► endsBefore(明天) 过滤
     │       │
@@ -488,10 +678,13 @@ RecurringCheck::handle()
     │               │     │
     │               │     └─► event(DocumentRecurring)
     │               │           └─► SendDocumentRecurringNotification
-    │               │                 ├─► 通知客户 (带PDF附件)
-    │               │                 ├─► event(DocumentSent) → status=sent
-    │               │                 └─► 通知公司管理员
-    │               │  }
+    │               │                 ├─► Gate1(配置存在?)
+    │               │                 ├─► Gate2(auto_send开?)
+    │               │                 ├─► Gate3a(客户可达?4条件)→通知客户
+    │               │                 ├─► ★event(config(DocumentSent/DocumentReceived))
+    │               │                 ├─► Gate3b(notify_user开关?)
+    │               │                 └─► Gate3c(用户权限?)→通知管理员
+    │               │  }  // 事务失败则该日期缺行，下次自动补
     │            }
     │        }
     │
@@ -510,12 +703,18 @@ Company::forgetCurrent()
 
 2. **父子关联**：子单据的 `parent_id` 指向模板 ID，这是防止重复生成和追溯的唯一依据。
 
-3. **日期去重**：每次调度时先查已生成子单据的日期数组，再从完整日程中过滤，不依赖次数计数。
+3. **日期差集去重 + 隐式重试**：每次调度实时查询子表日期做集合差集，天然实现"失败自动补单"，无需单独持久化重试队列。（代码注释明确写了 including the previously failed ones）
 
-4. **多公司上下文**：遍历前通过 `company()->makeCurrent()` 切换公司，确保多租户环境下正确使用配置（如时区、文档编号规则）。
+4. **custom 频率双字段**：内置频率(daily~yearly)的 interval 强制为 1，只有 custom 分支才允许自定义 interval + recurring_custom_frequency 字符串组合。
 
-5. **原子性**：每个 schedule 日期独立事务，单个失败不影响后续日期继续生成。
+5. **created_from/created_by 双级兜底**：先从 request 取，缺失时分别用 source_name()（识别 web/api/cli）和 user_id()（当前登录用户ID）兜底，updateRecurring 时不覆写。
 
-6. **克隆 + 修正**：使用 Cloneable 快速复制主记录及关联，再批量修正 type 字段。
+6. **多公司上下文 + 公司时区**：遍历前通过 `company()->makeCurrent()` 切换公司；Recurr Rule 的 `setTimezone()` + DateTime 构造都使用 `setting('localisation.timezone')`，与 app.timezone 解耦。
 
-7. **状态流转**：Recurring 记录初始为 `active`，全部日程生成完毕后自动更新为 `completed`。
+7. **VirtualLimit ≈ 2年软上限**：对无限/远期的 recurring 设置约2年的虚拟展开上限，防止 Recurr 一次性展开无穷多日期导致内存溢出。
+
+8. **三层通知 Gate + 配置驱动状态事件**：配置存在→auto_send→(客户可达性 / sent事件 / 用户通知开关 / 用户权限) 逐级短路。sent 事件类由 type 配置决定（invoice→DocumentSent，bill→DocumentReceived），实现业务语义差异。
+
+9. **原子性 + 失败隔离**：每个 schedule 日期独立事务，getModel() 内 try/catch 捕获异常返回 false，单个日期失败不影响后续日期及其他 recurring。
+
+10. **克隆 + 修正两步走**：使用 Cloneable 快速复制主记录及关联(去掉recurring以免模板关联链被复制)，再通过 updateRelationTypes 批量更新子关联的 type 字段与主记录对齐。

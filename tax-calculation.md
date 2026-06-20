@@ -559,28 +559,77 @@ $actual_price_item = $item_discounted_amount - $item_tax_total;
 
 ## 十、总结与使用建议
 
-### 含税与不含税计算时的注意事项
+### 计算口径与审计公式
 
-1. **以哪个为准**：后端保存的计算结果（写入数据库的）是最终可信值，但需注意 `document_totals` 中的 `sub_total` 和 `discount` 字段含义与前端展示不同。
+#### 后端最终总额的精确计算公式（代码口径）
 
-2. **调试时的坑点**：
-   - 不要用前端的 `totals.sub` 与数据库 `document_totals.code='sub_total'` 直接对比（含义不同）
-   - 不要用前端的全局折扣额与 `document_totals.code='discount'` 对比（基数不同）
-   - 排查税额差异时，重点检查 CreateDocumentItem.php L158-L162 的「加回全局折扣」逻辑
+依据 CreateDocumentItemsAndTotals.php#L50-L144，最终写入 `document.amount` 的计算过程：
 
-3. **修改建议**：若需要统一全局折扣基数，需同时修改以下三处：
-   - 后端 CreateDocumentItemsAndTotals.php L74（discount_total 计算基数）
-   - 后端 CreateDocumentItemsAndTotals.php L256（actual_total 扣除时的基数）
-   - 前端 documents.js 无需修改（与税额计算内部一致）
+ `
+步骤 1（L50）:
+  `->request['amount'] = ;`
+  // `` 由 createItems() 返回，其内部在 L256 已扣完全局折扣：
+  //   ` = Σ(->total) - 全局折扣`
+  //                 = Σ(行折扣后金额) - 全局折扣
 
-4. **审计思路**：验证单据总额正确性时，使用以下公式核对：
-   ```
-   最终应付 = Σ(price × qty) - Σ行折扣 - Σ全局折扣（正确基数） + Σ税费 + Σ额外费用
-   不要直接依赖 document_totals 的各字段简单相加。
-   ```
+步骤 2（L95-L113）:
+  逐笔加税：`->request['amount'] += ['amount'];`
+  // 注意：withholding（预扣税）的 `['amount']` 本身为负值，
+  //       所以 `+=` 操作的效果是从总额中扣除，无需特殊处理
+
+步骤 3（L116-L142）:
+  逐笔加/减额外费用：
+    operator='addition'（默认） `->request['amount'] += ['amount'];`
+    operator='subtraction'     `->request['amount'] -= ['amount'];`
+
+步骤 4（L144）:
+  `->request['amount'] = round(->request['amount'], );`
+ `
+
+将以上步骤合并，得到**审计用精算公式**：
+
+ `
+最终 amount = round(
+    Σ行折扣后金额 - 全局折扣                     // = ``
+    + Σ(tax_amount)                              // normal/inclusive/compound 为正，withholding 为负
+    + Σextra（按 operator 加或减）               // 默认 addition 加
+, `` )
+ `
+
+等价展开（便于人工核对）：
+ `
+最终 amount = round(
+    Σ(price  qty)
+    - Σ行折扣                                    // 行折扣 = priceqty  行折扣率
+    - 全局折扣（百分比：Σ行折扣后  折扣率；固定：直接减）
+    + Σnormal 税 + Σinclusive 税 + Σcompound 税
+    - Σwithholding 税                           // 由计算时保证为负值
+    + Σ运费等额外费用（按 operator 判断符号）
+, `` )
+ `
+
+> **关键提示**：`document_totals` 表中 sub_total（code='sub_total'）、item_discount（code='item_discount'）、discount（code='discount'）都是**展示中间值**，**不参与**最终 amount 的计算。不要用它们相加来推导总额，而应使用以上公式。
 
 ---
 
+### 使用建议与调试坑点
+
+1. **以哪个为准**：
+   - 写入数据库的 `document.amount` 和 `document_totals.code='total'` 是最终可信值。
+   - 前端预览仅供参考，若后端舍入时机不同，可能与最终入库值有 0.01 的尾差。
+
+2. **调试时的坑点**：
+   - 前端 `totals.sub`（= Σ原价）与后端 `document_totals.code='sub_total'`（= Σ行折扣后）含义与数值不同，不要直接对比。
+   - 前端全局折扣额（Σ逐行  折扣率）与后端 `document_totals.code='discount'`（sub_total  折扣率）由**乘法分配律**保证数学等价，不必怀疑。
+   - 排查税额差异时，重点检查 `CreateDocumentItem.php L158-L162` 的「加回全局折扣」逻辑只影响存储的 total，不影响税额本身。
+   - 检查 withholding 税时，不要忘了它的 tax_amount 是**负值**，后端在 L109 用 `+=` 直接加。
+
+3. **无需修改全局折扣基数**：
+   百分比全局折扣场景下，后端 `sub_total  折扣率` 与前端 `Σ(行折扣后金额  折扣率)` 由乘法分配律：
+   `Σ(aᵢ  r) = (Σaᵢ)  r`
+   保证数学等价。当前代码 `CreateDocumentItemsAndTotals.php L74` 与 `CreateDocumentItemsAndTotals.php L256` 的基数选择是正确的，L73 注释掉的旧代码 `( - )  ...` 会双重扣减行折扣，不应恢复。
+
+---
 ## 十一、代码逐行追踪：行折扣、百分比全局折扣与最终汇总扣减的完整关联
 
 > 本章用具体数值逐行追踪三段核心代码的变量变化，彻底讲清三者之间的关联与分歧。

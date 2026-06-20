@@ -186,6 +186,146 @@ if (! empty($this->request['global_discount'])) {
 >
 > 注意：compound 税是基于前面所有税计算后的累计金额计算的。
 
+#### 4.2.1 复合税（Compound）Base 的累加构成详解
+
+复合税的计算基数（base）是**动态累加**的，每一步计算都会影响最终结果。
+
+**后端计算链路（CreateDocumentItem.php:58-155）**
+
+```php
+// Line 60: 初始化三个关键变量
+$actual_price_item = $item_amount = $item_discounted_amount;
+// 此时：三者都等于 折扣后的金额 (price × quantity - 行折扣 - 全局折扣)
+
+// ── 第1步：inclusive 价内税 ──────────────────────────────────
+// Line 82-96
+foreach ($inclusives as $inclusive) {
+    $tax_amount = $item_discounted_amount - ($item_discounted_amount / (1 + $inclusive->rate / 100));
+    $item_tax_total += $tax_amount;
+}
+$actual_price_item = $item_discounted_amount - $item_tax_total;
+// 此时：$actual_price_item = 不含价内税的净价
+// 注意：$item_amount 此时未变，还是折扣后的金额
+
+// ── 第2步：fixed 固定税 ────────────────────────────────────
+// Line 98-111
+foreach ($fixeds as $tax) {
+    $tax_amount = $tax->rate * (double) $this->request['quantity'];
+    $item_amount += $tax_amount;  // ← 累加到 $item_amount
+}
+
+// ── 第3步：normal 普通税 ───────────────────────────────────
+// Line 113-126
+foreach ($normals as $tax) {
+    $tax_amount = $actual_price_item * ($tax->rate / 100);
+    $item_amount += $tax_amount;  // ← 累加到 $item_amount
+}
+
+// ── 第4步：withholding 预扣税 ──────────────────────────────
+// Line 128-141
+foreach ($withholdings as $tax) {
+    $tax_amount = -($actual_price_item * ($tax->rate / 100)); // 负数
+    $item_amount += $tax_amount;  // ← 累加到 $item_amount（扣减）
+}
+
+// ── 第5步：compound 复合税 ─────────────────────────────────
+// Line 143-155
+foreach ($compounds as $compound) {
+    // 重点：base 是 $item_amount，包含了前面所有税！
+    $tax_amount = ($item_amount / 100) * $compound->rate;
+    $item_tax_total += $tax_amount;
+}
+```
+
+**复合税 Base 构成公式：**
+```
+compound_base = 折扣后金额 + fixed税总额 + normal税总额 + withholding税总额
+```
+
+> **关键区别**：normal/withholding 税基于 `$actual_price_item`（折扣后 - 价内税）计算，
+> 而 compound 税基于 `$item_amount`（折扣后 + 所有已算税种）计算。
+
+**前端对应逻辑（documents.js:513-524）**
+```javascript
+// Line 513: 先累加 fixed/normal/withholding 税到 grand_total
+item.grand_total += total_tax_amount;
+
+// Line 515-524: 复合税基于累加后的 grand_total 计算
+if (compounds.length) {
+    compounds.forEach(function(compound) {
+        item.tax_ids[compound.tax_index].price = 
+            this.numberFormat((item.grand_total / 100) * compound.tax_rate, this.currency.precision);
+        
+        item.grand_total += item.tax_ids[compound.tax_index].price;
+    }, this);
+}
+```
+
+#### 4.2.2 多税聚合（多税种、多行项目）
+
+当一张单据包含多行、每行又包含多个税种时，需要按税种分组聚合。
+
+**前端聚合逻辑（documents.js:569-587）**
+```javascript
+calculateTotalsTax(totals_taxes, id, name, price) {
+    let total_tax_index = totals_taxes.findIndex(total_tax => total_tax.id === id);
+    
+    if (total_tax_index === -1) {
+        // 新税种，新增记录
+        totals_taxes.push({ id: id, name: name, total: price });
+    } else {
+        // 已有税种，累加金额
+        totals_taxes[total_tax_index].total = 
+            parseFloat(totals_taxes[total_tax_index].total) + parseFloat(price);
+    }
+    return totals_taxes;
+}
+```
+
+**后端聚合逻辑（CreateDocumentItemsAndTotals.php:240-250）**
+```php
+foreach ((array) $document_item->item_taxes as $item_tax) {
+    if (array_key_exists($item_tax['tax_id'], $taxes)) {
+        // 已有税种，累加
+        $taxes[$item_tax['tax_id']]['amount'] += 
+            round((float) $item_tax['amount'], $this->document->currency->precision);
+    } else {
+        // 新税种，新增
+        $taxes[$item_tax['tax_id']] = [
+            'name' => $item_tax['name'],
+            'amount' => round((float) $item_tax['amount'], $this->document->currency->precision),
+        ];
+    }
+}
+```
+
+**聚合后写入 DocumentTotal（CreateDocumentItemsAndTotals.php:95-113）**
+```php
+// 为每个税种创建一条 DocumentTotal 记录
+foreach ($taxes as $tax) {
+    DocumentTotal::create([
+        'code' => 'tax',
+        'name' => Str::ucfirst($tax['name']),
+        'amount' => round(abs($tax['amount']), $precision),
+        'sort_order' => $sort_order++,
+    ]);
+}
+```
+
+**多税聚合示例：**
+```
+行1: 商品A，数量×单价=100，税种：增值税13% + 消费税5%
+   → 增值税: 13, 消费税: 5
+   
+行2: 商品B，数量×单价=200，税种：增值税13% + 复合税2%
+   → 增值税: 26, 复合税: (200+26)×2% = 4.52
+
+聚合后 DocumentTotal:
+  - tax (增值税): 13 + 26 = 39
+  - tax (消费税): 5
+  - tax (复合税): 4.52
+```
+
 ### 4.3 全局折扣分摊逻辑
 
 **函数：** `fixedDiscountCalculate()` [CreateDocumentItemsAndTotals.php:265-289](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Jobs/Document/CreateDocumentItemsAndTotals.php#L265-L289)

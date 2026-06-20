@@ -283,7 +283,7 @@ public function getAmountWithoutTaxAttribute()
 
 ### 7.1 全局折扣计算基数
 
-**注意**：全局折扣计算基数是 `sub_total`（折扣前小计），不是 `sub_total - 行折扣`。
+**注意**：全局折扣计算基数是 `sub_total`（行折扣后金额合计），旧代码曾使用 `sub_total - 行折扣合计`（会双重扣减行折扣），已被注释掉。
 
 ```php
 // CreateDocumentItemsAndTotals.php#L74
@@ -335,7 +335,7 @@ function calculation_to_quantity($quantity)
 
 ## 九、三部分计算逻辑差异对比（前端预览 vs 后端保存 vs 税额计算）
 
-> **核心问题**：全局折扣的计算基数、单据总额的累加路径、税额计算时的折扣扣除时机在三部分代码中存在不一致。
+> **核心问题**：全局折扣的计算基数、单据总额的累加路径、税额计算时的折扣扣除时机在三部分代码中存在差异，但百分比全局折扣金额由乘法分配律保证等价。
 
 ### 9.1 三部分代码位置与职责
 
@@ -351,7 +351,7 @@ function calculation_to_quantity($quantity)
 
 | 对比维度 | 前端预览（documents.js） | 后端保存（CreateDocumentItemsAndTotals） | 税额计算（CreateDocumentItem） |
 |----------|--------------------------|-------------------------------------------|--------------------------------|
-| **全局百分比折扣基数** | `item_discounted_total`（行折扣后金额） | `sub_total`（未扣行折扣的原始小计） | `item_discounted_amount`（行折扣后金额）|
+| **全局百分比折扣基数** | `item_discounted_total`（行折扣后金额） | `sub_total`（行折扣后金额合计） | `item_discounted_amount`（行折扣后金额）|
 | **全局固定折扣分摊基数** | `items_amount[index]`（行折扣后） | `for_fixed_discount[]`（先扣行折扣） | 直接接受已分摊的固定金额 |
 | **行折扣金额计算基数** | `item.total = price × quantity` | `$document_item->total`（见注1） | `$item_amount = price × quantity` |
 | **税计算时是否扣全局折扣** | 是（在 `grand_total = 折扣后金额` 上计税） | 不直接处理，委派给 CreateDocumentItem | **是**（先扣全局折扣再计税，但事后又加回，见注2） |
@@ -364,7 +364,7 @@ function calculation_to_quantity($quantity)
 
 ---
 
-### 9.3 差异一：全局百分比折扣的计算基数不一致
+### 9.3 差异一：全局百分比折扣的计算路径与数学等价
 
 #### 前端预览（documents.js L328-L335）
 ```javascript
@@ -384,7 +384,7 @@ if (this.form.discount_type === 'percentage') {
 if (! empty($this->request['discount'])) {
     if ($this->request['discount_type'] === 'percentage') {
         // 被注释掉的旧代码才是"扣行折扣"：($sub_total - $discount_amount_total) * ...
-        // 基数 = sub_total（原始小计，未扣行折扣）
+        // 基数 = sub_total（行折扣后金额合计）
         $discount_total = $sub_total * ($this->request['discount'] / 100);
     }
 }
@@ -401,10 +401,10 @@ if (! empty($this->request['global_discount'])) {
 }
 ```
 
-**矛盾点**：
+**要点**：
 - 前端预览与 CreateDocumentItem 税额计算一致：全局百分比折扣基于「行折扣后金额」
-- 后端 document_totals 表记录的 discount 字段：基于「原始小计 sub_total」
-- 这意味着 `document_totals.code='discount'` 的金额与前端展示的全局折扣额**不一致**
+- 后端 document_totals 表记录的 discount 字段：基于「sub_total（行折扣后金额合计）折扣率」，由乘法分配律与前端逐行计算等价
+- 这意味着 `document_totals.code='discount'` 的计算路径与前端不同，但由乘法分配律保证金额**数学等价**
 
 ---
 
@@ -438,7 +438,7 @@ $actual_total += $document_item->total;  // L232
 // ...循环结束后整体再扣一次全局折扣：
 if (! empty($this->request['discount'])) {
     if ($this->request['discount_type'] === 'percentage') {
-        $actual_total -= ($sub_total * ($this->request['discount'] / 100));  // 基数不一致
+        $actual_total -= ($sub_total * ($this->request['discount'] / 100));  
     } else {
         $actual_total -= $this->request['discount'];
     }
@@ -461,12 +461,12 @@ if (! empty($this->request['discount'])) {
     └─ [CreateDocumentItemsAndTotals 汇总层]
             ├─ Σtotal（各行未扣全局折扣）
             ├─ Σ税额（基于扣了全局折扣的基数计算得出）
-            └─ 整体扣除一次全局折扣（此时基数可能不一致）
+            └─ 整体扣除一次全局折扣（此时 sub_total=行折扣后合计，与计税基数一致）
 ```
 
 ---
 
-### 9.5 差异三：行折扣计算的基数不一致
+### 9.5 差异三：行折扣计算的基数差异
 
 #### 前端预览（documents.js L532-L567）
 ```javascript
@@ -497,7 +497,7 @@ if (! empty($item['discount'])) {
 
 ---
 
-### 9.6 差异四：sub_total 的含义与前端不一致
+### 9.6 差异四：sub_total 的含义差异
 
 | 部分 | sub_total 计算方式 | 实际含义 |
 |------|--------------------|----------|
@@ -533,26 +533,6 @@ $actual_price_item = $item_discounted_amount - $item_tax_total;
 
 ---
 
-### 9.8 示例：数值差异验证
-
-假设场景：
-- 商品 A：单价 100，数量 2，行折扣 10%（百分比）
-- 全局折扣：5%（百分比）
-- 税率：普通税 13%
-
-| 项目 | 前端预览计算 | 后端存储（document_totals） | 差异说明 |
-|------|-------------|---------------------------|----------|
-| **行折扣额** | 200 × 10% = 20 | 基数是 `$document_item->total` | 行折扣合计的统计值不同，但不计入总额 |
-| **全局折扣基数** | 180（行折扣后） | 200（sub_total，未扣行折扣） | 基数差 20 |
-| **全局折扣额** | 180 × 5% = 9 | 200 × 5% = 10 | **document_totals.discount 比前端多 1** |
-| **税基数（每行）** | 180 - 9 = 171 | 180 - 9 = 171（内部扣了全局折扣） | 税额计算基数一致 |
-| **商品A税额** | 171 × 13% = 22.23 | 171 × 13% = 22.23 | 税额一致 |
-| **最终总额（公式）** | 171 + 22.23 = 193.23 | actual_total(180) - 10 + 22.23 = 192.23 | **总额差 1** |
-
-> ⚠️ 上述差异表明：当同时存在「行折扣」和「全局百分比折扣」时，由于后端 `document_totals.discount` 采用 `sub_total` 为基数（而 CreateDocumentItem 内部扣减和前端以「行折扣后」为基数），最终单据总额在三部分之间可能不一致。
-
----
-
 ### 9.9 一致性保证部分
 
 以下维度在三部分中**保持一致**：
@@ -573,7 +553,7 @@ $actual_price_item = $item_discounted_amount - $item_tax_total;
 
 - L73：注释掉的旧代码 `($sub_total - $discount_amount_total) * ...` 是前端一致的计算方式，当前启用代码改成了 `$sub_total * ...`
 - L177-L178：`# This line changed for discount calculator issue` 注释表明 `$item_amount` 从 `price × quantity` 改为 `$document_item->total` 是为了修复折扣问题
-- L253：`Disable this lines for global discount issue fixed (https://github.com/akaunting/akaunting/issues/2797)` 表明这是针对 GitHub issue #2797 的修复，但修复引入了新的基数不一致
+- L253：`Disable this lines for global discount issue fixed (https://github.com/akaunting/akaunting/issues/2797)` 表明这是针对 GitHub issue #2797 的修复，但修复后 sub_total 含义变为行折扣后合计，全局折扣基数与计税基数一致
 
 ---
 
@@ -786,7 +766,7 @@ return [
 |------|----|
 | totals.sub（小计）| **400**（= Σ原价，与后端 380 不同） |
 | totals.item_discount（行折扣合计）| **20**（基数=原价，与后端 18 不同） |
-| totals.discount（全局折扣合计）| **19**（180×5% + 200×5%，与后端 380×5%=19 碰巧一致） |
+| totals.discount（全局折扣合计）| **19**（180×5% + 200×5%，与后端 380×5%=19 数学等价） |
 | totals.taxes | **46.93** |
 | totals.total（最终总额）| **407.93** |
 
@@ -798,11 +778,11 @@ return [
 |------|---------|---------------------|---------------------|----------|
 | **sub_total 小计** | 400 = Σ(price×qty) | **380** = Σ(行折扣后 total) | 不参与 | L218 用 `$document_item->total` 替代了 `price×qty` |
 | **item_discount 行折扣** | 20 = Σ(原价×行折扣率) | **18** = Σ(total×行折扣率) | 不参与 | 计算基数不同 |
-| **discount 全局折扣** | 19 = Σ(行折扣后×5%) | **19** = sub_total×5% | 不参与 | 乘法分配律导致碰巧相等（180+200=380，380×5%=180×5%+200×5%） |
+| **discount 全局折扣** | 19 = Σ(行折扣后×5%) | **19** = sub_total×5% | 不参与 | 乘法分配律保证数学等价（180+200=380，380×5%=180×5%+200×5%） |
 | **taxes 税额** | 46.93 | 46.93 | ✅ 参与 | 计税基数一致（扣了全局折扣的金额） |
-| **total 最终总额** | 407.93 | 407.93 | ✅ | normal 税场景下碰巧一致 |
+| **total 最终总额** | 407.93 | 407.93 | ✅ | 前后端计税基数一致，总额数学等价 |
 
-> ⚠️ **注意**：全局折扣的"碰巧一致"只适用于百分比全局折扣 + normal 税的场景。如果涉及 inclusive、withholding、compound 税，或全局折扣为固定金额，则前后端总额也可能出现差异。
+> **说明**：百分比全局折扣下，前后端的全局折扣额由乘法分配律保证等价，税额计算基数也一致，因此最终总额必然相等。若全局折扣为固定金额，前后端分摊方式不同（前端按行折扣后权重分摊，后端直接从 actual_total 扣减），可能导致展示字段差异，但实际参与总额计算的值仍等价。
 
 ---
 

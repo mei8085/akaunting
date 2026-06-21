@@ -50,25 +50,58 @@ protected function schedule(Schedule $schedule)
 
 ### 3.1 Document 模板创建路径
 
-**Job**：[CreateDocument.php](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Jobs/Document/CreateDocument.php#L20-L57)
+**Job**：[CreateDocument.php](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Jobs/Document/CreateDocument.php#L20-L68)
 
 ```
-用户提交创建请求
+handle() 入口
+    │
+    ├─► 【子步骤 1】authorize() ← 套餐配额鉴权（事务外）
+    │     └─ getAnyActionLimitOfPlan()
+    │        仅对 type=invoice 检查；超限则 throw Exception 直接终止
+    │
+    ├─► 【子步骤 2】amount 空值兜底（事务外）
+    │     └─ empty(amount) → amount = 0
+    │
+    ├─► 【子步骤 3】discount 字段兼容（事务外）
+    │     └─ !empty(discount) → discount_rate = discount
+    │        （历史兼容 issue #2797，老字段名 discount → 新字段名 discount_rate）
+    │
+    ├─► event(DocumentCreating)  ← 前置事件
+    │
+    ▼
+┌─ DB::transaction ────────────────────────────────────────────┐
+│                                                              │
+│  ┌─ 【子步骤 4】attachment 媒体上传 ───────────────────────┐  │
+│  │ Document::create(...)  → 主记录落库                     │  │
+│  │   ↓                                                     │  │
+│  │ request 有 attachment 文件 → 遍历上传：                  │  │
+│  │   getMedia($file, 'invoices')  ← Uploads::getMedia()    │  │
+│  │     → 路径: YYYY/MM/DD/{company_id}/{type}s/            │  │
+│  │   → $model->attachMedia($media, 'attachment')           │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                              │
+│      ↓                                                        │
+│  dispatch(new CreateDocumentItemsAndTotals)  ← 明细行+总计行  │
+│      ↓                                                        │
+│  $model->update($request->all())                              │
+│      ↓                                                        │
+│  $model->createRecurring($request->all())  ← ★ 生成 recurring│
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
     ↓
-DocumentCreated Event 前置检查
-    ↓
-DB::transaction {
-    Document::create(...)         ← 落库 documents 表
-    ↓
-    CreateDocumentItemsAndTotals  ← 创建明细行和总计行
-    ↓
-    $model->update(...)
-    ↓
-    $model->createRecurring(...)  ← ★ 创建 recurring 记录
-}
-    ↓
-DocumentCreated Event 触发
+event(DocumentCreated)
 ```
+
+**四个子步骤详解（★补充）：**
+
+| 序号 | 子步骤 | 位置 | 核心逻辑 | 代码行 |
+|------|--------|------|----------|--------|
+| 1 | **authorize 鉴权** | 事务外，最前置 | `getAnyActionLimitOfPlan()` 取套餐配额；仅对 `type=invoice` 生效；`action_status=false` 则抛出异常直接中止创建 | 第 22/62-68 行 |
+| 2 | **amount 空值兜底** | 事务外 | `empty($this->request['amount'])` → 强制设为 `0`，防止空值入库 | 第 24-26 行 |
+| 3 | **discount 字段兼容** | 事务外 | 若请求传了 `discount`（老字段），同步赋值给 `discount_rate`（新字段）；注释明确写了是 issue #2797 全局折扣问题修复后保留的兼容 | 第 28-31 行 |
+| 4 | **attachment 媒体上传** | 事务内，主记录创建后 | 遍历 `$request->file('attachment')` 数组；`getMedia()` 调 `MediaUploader` 上传到 `YYYY/MM/DD/{company_id}/invoices/` 目录；`attachMedia()` 建立媒体-单据关联 | 第 39-45 行 |
+
+> 注：前 3 个在事务外执行，失败不涉及回滚；第 4 个在事务内，上传成功后若后续步骤失败，事务回滚但**已上传的物理文件不会自动删除**（MediaUploader 写磁盘不在 DB 事务内）。
 
 关键代码 (第 51 行)：
 ```php
@@ -375,17 +408,39 @@ protected function recur(Document|Transaction $template, Date $schedule_date): v
 - 异常被 `getModel()` 捕获，不影响其他 schedule 继续执行
 - 事务成功后触发对应的 Created 事件和 Recurring 事件
 
-### 5.1 getModel() 分发
+### 5.1 getModel() 分发 + 异常出口（★补充）
+
+**源码位置**：[RecurringCheck.php#L190-L203](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Console/Commands/RecurringCheck.php#L190-L203)
 
 ```
-getModel($template, $schedule_date)
-    ↓
+getModel(Document|Transaction $template, Date $schedule_date): Document|Transaction|bool
+    │
+    ▼
 判断模板类型：
-    Transaction → getTransactionModel()
-    Document    → getDocumentModel()
-    ↓
-try { 调用具体方法 } catch { report + return false }
+    Transaction → $this->getTransactionModel($template, $schedule_date)
+    Document    → $this->getDocumentModel($template, $schedule_date)
+    │
+    ▼
+try { 调用具体方法 }
+    │
+    ├── 成功 → 返回 Document 或 Transaction 实例
+    │
+    └── 失败 → catch(\Exception $e) { report($e); return false; }
+                └─ 异常只被 report 日志记录，不冒泡
+                   返回值类型从对象跌为 bool false
 ```
+
+**返回类型与异常出口要点：**
+
+| 项 | 说明 |
+|----|------|
+| **声明返回类型** | `Document|Transaction|bool` 三联合类型（PHP 8 联合类型） |
+| **正常返回** | `Document` 或 `Transaction` Eloquent 模型实例 |
+| **异常出口** | `catch (\Exception $e) { report($e); return false; }` —— **任何异常都被吞掉**，写日志后返回 `false` |
+| **调用方的短路处理** | `recur()` 里 `if (! $model = $this->getModel(...)) { return; }` —— 用 false 做松散比较直接跳过该 schedule |
+| **设计意图** | 失败隔离：某一个 schedule 日期生成失败（如 Cloneable 克隆异常、save 失败、关联更新异常），不影响其他日期和其他 recurring 继续执行 |
+
+> **隐患**：`false` 与 null/0/空字符串 在 PHP 松散比较下都为 falsy。这里依赖 `$model = ...` 赋值后再 `!` 取反，只要返回 false 就跳过，语义是清晰的；但若有一天 getDocumentModel 意外返回 null 或 0，也会被"静默跳过"。
 
 ### 5.2 生成 Document 子单据：getDocumentModel()
 
@@ -486,7 +541,79 @@ public function updateRelationTypes($model, $relations)
 | created_from | string | 创建来源（request[created_from] 或 source_name() 兜底） |
 | created_by | FK | 创建人（request[created_by] 或 user_id() 兜底） |
 
-### 6.2 documents 表（单据主表）
+### 6.2 Recurring 状态机（★补充）
+
+**模型常量定义**：[Common/Recurring.php#L13-L15](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Models/Common/Recurring.php#L13-L15)
+
+```php
+public const ACTIVE_STATUS   = 'active';
+public const END_STATUS      = 'ended';
+public const COMPLETE_STATUS = 'completed';
+```
+
+#### 6.2.1 三种状态语义
+
+| 状态 | 英文常量 | 含义 |
+|------|---------|------|
+| **active** | ACTIVE_STATUS | 激活中，正常按计划生成单据 |
+| **ended** | END_STATUS | 用户手动终止（提前结束） |
+| **completed** | COMPLETE_STATUS | 全部到期/生成完毕（自然终结） |
+
+> 区别：`ended` 是人为干预的"提前结束"，`completed` 是全部 schedule 都生成完后的"自然结束"。两者都是终态，不会再生成新单据。
+
+#### 6.2.2 两条状态流转路径
+
+```
+                    ┌──────────────────┐
+                    │      active      │  ← 初始状态（createRecurring 时默认）
+                    └──────────────────┘
+                          /       \
+                         /         \
+    【路径A】手动 end     /           \    【路径B】自动 complete
+   用户点击"End"按钮    /             \   所有日程生成完毕
+                       /               \
+                      ▼                 ▼
+            ┌──────────────┐    ┌───────────────┐
+            │    ended     │    │   completed   │
+            │ (手动终止)   │    │  (自然结束)    │
+            └──────────────┘    └───────────────┘
+                       \             /
+                        \           /
+                         \         /
+                          终态，无回退
+```
+
+**路径 A：active → ended（手动终止）**
+
+| 维度 | 说明 |
+|------|------|
+| **触发入口** | 三个 Controller 的 `end()` 方法 |
+| **Controller 文件** | [RecurringInvoices.php#L209-L226](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Http/Controllers/Sales/RecurringInvoices.php#L209-L226)、[RecurringBills.php#L209-L224](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Http/Controllers/Purchases/RecurringBills.php#L209-L224)、[RecurringTransactions.php#L245-L262](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Http/Controllers/Banking/RecurringTransactions.php#L245-L262) |
+| **执行路径** | Controller 调用 `ajaxDispatch(new UpdateDocument/UpdateTransaction(...))`，传入 `recurring_status = Recurring::END_STATUS` → Update Job 内部调用 `$model->updateRecurring()` → 走 [Traits/Recurring.php](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Traits/Recurring.php#L45-L91) 的 update 分支 `$this->recurring()->update(...)` |
+| **关键参数** | 除了 recurring_status=ended，还会原样传入当前的 frequency、started_at、limit 等字段（避免 update 时被覆盖丢失） |
+| **UI 显隐逻辑** | 模板列表的操作按钮里，只有当 `recurring->status != 'ended'` 时才显示 "End" 按钮（[Document.php#L750](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Models/Document/Document.php#L750) / [Transaction.php#L724](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Models/Banking/Transaction.php#L724)） |
+
+**路径 B：active → completed（自动迁移）**
+
+| 维度 | 说明 |
+|------|------|
+| **触发入口** | `RecurringCheck::handle()` 调度命令内部 |
+| **代码位置** | [RecurringCheck.php#L130-L135](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Console/Commands/RecurringCheck.php#L130-L135) |
+| **触发条件** | `getRemainingSchedules()` 返回的 `$schedules->count() == 0`（所有应生成的日程都已落库，无剩余） |
+| **执行操作** | `$recur->update(['status' => Recurring::COMPLETE_STATUS])` |
+| **后续行为** | `continue` 跳过后续 schedule 循环（本来就为空），处理下一条 recurring |
+| **调度匹配范围** | 只有 `scopeActive()` 的记录会被 `Recurring::active()` 查询到；状态变为 completed 后，下次调度不再进入遍历 |
+
+> 注意：`Recurring::active()` 是 scope，只查 status = active 的记录。所以 ended 和 completed 的 recurring 都不会再被调度处理。
+
+#### 6.2.3 状态机与调度查询的关系
+
+调度命令起始处用 `Recurring::active()->allCompanies()->cursor()` 取数，意味着：
+- **只有 active 状态的 recurring 才会被调度处理**
+- ended 状态：用户手动终止 → 不再调度（用户主动行为）
+- completed 状态：全部生成完 → 不再调度（自然完成行为）
+
+### 6.3 documents 表（单据主表）
 
 当生成 Document 类型子单据时：
 
@@ -498,7 +625,7 @@ public function updateRelationTypes($model, $relations)
 
 同时 `document_items`、`document_totals` 的 `type` 也被同步更新。
 
-### 6.3 transactions 表（交易主表）
+### 6.4 transactions 表（交易主表）
 
 当生成 Transaction 类型子单据时：
 
@@ -718,3 +845,9 @@ Company::forgetCurrent()
 9. **原子性 + 失败隔离**：每个 schedule 日期独立事务，getModel() 内 try/catch 捕获异常返回 false，单个日期失败不影响后续日期及其他 recurring。
 
 10. **克隆 + 修正两步走**：使用 Cloneable 快速复制主记录及关联(去掉recurring以免模板关联链被复制)，再通过 updateRelationTypes 批量更新子关联的 type 字段与主记录对齐。
+
+11. **getModel 双类型返回 + 静默异常出口**：声明返回 `Document|Transaction|bool` 三联合类型；正常返回模型实例，异常时 catch 吞掉 + report 日志 + return false；调用方用 `!$model` 松散比较短路跳过。代价是任何异常都会被静默，只能靠日志发现。
+
+12. **三状态机 + 双流转路径**：active(运行中)、ended(手动终止)、completed(自然完成) 三态。ended 由用户点击 End 按钮经 Update Job 的 updateRecurring 写入；completed 由调度器检测剩余日程为 0 时自动迁移。两态都是终态，不再进入 active scope 的调度遍历。
+
+13. **CreateDocument 四步前置流水线**：事务外依次执行 authorize(套餐配额校验，仅 invoice) → amount 空值兜底为 0 → discount 老字段兼容为 discount_rate → DocumentCreating 事件；事务内第一步是 Document::create 紧接着 attachment 媒体上传(磁盘IO不在DB事务内，回滚不删文件)。

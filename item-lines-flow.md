@@ -188,7 +188,7 @@ if (! empty($this->request['global_discount'])) {
 
 #### 4.2.1 复合税（Compound）Base 的累加构成详解
 
-复合税的计算基数（base）是**动态累加**的，每一步计算都会影响最终结果。
+复合税的计算基数（base）是**动态累加**的，但有一个**关键的剥离机制**：价内税会被从 base 中剥离，不会被复合税叠加计算。
 
 **后端计算链路（CreateDocumentItem.php:58-155）**
 
@@ -205,11 +205,17 @@ foreach ($inclusives as $inclusive) {
 }
 $actual_price_item = $item_discounted_amount - $item_tax_total;
 // 此时：$actual_price_item = 不含价内税的净价
-// 注意：$item_amount 此时未变，还是折扣后的金额
+// ⚠️ 重要：$item_amount 此时未变，还是 $item_discounted_amount！
+//         价内税只影响 $actual_price_item，不影响 $item_amount
+//         这就是为什么复合税 base 中不包含价内税
 
 // ── 第2步：fixed 固定税 ────────────────────────────────────
 // Line 98-111
 foreach ($fixeds as $tax) {
+    // ⚠️ 数量参数说明：
+    // 这里的 $this->request['quantity'] 已经经过 FormRequest 中的
+    // calculation_to_quantity() 转换（Document.php L97-118）
+    // 例如输入 "2x3" 已经变成 6，所以这里 (double) 只是类型转换
     $tax_amount = $tax->rate * (double) $this->request['quantity'];
     $item_amount += $tax_amount;  // ← 累加到 $item_amount
 }
@@ -231,28 +237,62 @@ foreach ($withholdings as $tax) {
 // ── 第5步：compound 复合税 ─────────────────────────────────
 // Line 143-155
 foreach ($compounds as $compound) {
-    // 重点：base 是 $item_amount，包含了前面所有税！
+    // 重点：base = $item_amount = 折扣后金额 + fixed + normal + withholding
+    //       但 不包含 价内税！因为 $item_amount 在价内税阶段没有被修改
     $tax_amount = ($item_amount / 100) * $compound->rate;
     $item_tax_total += $tax_amount;
 }
 ```
 
-**复合税 Base 构成公式：**
-```
-compound_base = 折扣后金额 + fixed税总额 + normal税总额 + withholding税总额
+**⚠️ 复合税 Base 漏掉价内税的原理：**
+
+关键在于 Line 60 的初始化和 Line 95 的赋值：
+```php
+Line 60:  $actual_price_item = $item_amount = $item_discounted_amount;
+          // 三者指向同一个值，但后续修改互不影响
+
+Line 82-96: 价内税计算时
+          - 只修改了 $item_tax_total（累加）
+          - 只修改了 $actual_price_item（剥离价内税）
+          - ❌ 没有修改 $item_amount！！
+
+Line 95:  $actual_price_item = $item_discounted_amount - $item_tax_total;
+          // 价内税只从 $actual_price_item 中剥离
 ```
 
-> **关键区别**：normal/withholding 税基于 `$actual_price_item`（折扣后 - 价内税）计算，
-> 而 compound 税基于 `$item_amount`（折扣后 + 所有已算税种）计算。
+所以复合税 base 的真实构成是：
+
+```
+compound_base = $item_amount
+              = $item_discounted_amount  (初始值)
+              + Σ fixed_tax_amount       (第2步累加)
+              + Σ normal_tax_amount      (第3步累加)
+              + Σ withholding_tax_amount (第4步累加，负数)
+```
+
+**修正后的复合税 Base 公式：**
+```
+compound_base = 折扣后金额 + fixed税总额 + normal税总额 + withholding税总额
+              = 不含价内税，且是扣除全局折扣后的金额
+```
+
+> **关键区别**：
+> - normal/withholding 税基于 `$actual_price_item`（折扣后 - 价内税 - 全局折扣）
+> - compound 税基于 `$item_amount`（折扣后 - 全局折扣 + fixed/normal/withholding）
+> - **两者都不包含价内税，但基数完全不同**
 
 **前端对应逻辑（documents.js:513-524）**
 ```javascript
 // Line 513: 先累加 fixed/normal/withholding 税到 grand_total
+// total_tax_amount = Σ fixed + Σ normal + Σ withholding(负数)
 item.grand_total += total_tax_amount;
 
 // Line 515-524: 复合税基于累加后的 grand_total 计算
 if (compounds.length) {
     compounds.forEach(function(compound) {
+        // 这里的 grand_total 中也不包含价内税！
+        // 因为价内税在 L471 是做减法：item.total = grand_total - inclusive_tax_total
+        // 而这里用的是 item.grand_total（减法之前的值）
         item.tax_ids[compound.tax_index].price = 
             this.numberFormat((item.grand_total / 100) * compound.tax_rate, this.currency.precision);
         
@@ -260,6 +300,136 @@ if (compounds.length) {
     }, this);
 }
 ```
+
+**前端 fixed 税的数量参数（documents.js:477）：**
+```javascript
+// 前端用 calculationToQuantity() 计算原始字符串表达式
+// 与后端 FormRequest 中提前转换不同，前端是即时计算
+item.tax_ids[fixed.tax_index].price = 
+    this.numberFormat(fixed.tax_rate * calculationToQuantity(item.quantity), ...);
+// 例如 item.quantity = "2x3"，这里先计算 2*3=6，再乘税率
+```
+
+#### 4.2.1.1 全局折扣加回与税种计算的边界判断
+
+**⚠️ 极其重要但容易被忽略的逻辑（CreateDocumentItem.php:158-162）：**
+
+在所有税种计算完成后，代码会执行全局折扣「加回」操作：
+
+```php
+// Line 47-56: 计算时先扣除全局折扣
+if (! empty($this->request['global_discount'])) {
+    if ($this->request['global_discount_type'] === 'percentage') {
+        $global_discount = $item_discounted_amount * ($this->request['global_discount'] / 100);
+    } else {
+        $global_discount = $this->request['global_discount'];
+    }
+    $item_discounted_amount -= $global_discount;  // ← 扣除全局折扣
+}
+
+// ... 中间执行所有税种计算（基于扣除全局折扣后的金额）...
+
+// Line 158-162: 税种计算完后，把全局折扣加回来
+if (! empty($global_discount)) {
+    $actual_price_item += $global_discount;  // ← 加回
+    $item_amount += $global_discount;        // ← 加回
+    $item_discounted_amount += $global_discount;  // ← 加回
+}
+```
+
+**边界判断条件分析：**
+
+| 场景 | `$this->request['global_discount']` | `$global_discount` 变量 | Line 48 执行 | Line 158 执行 |
+|------|-------------------------------------|------------------------|-------------|--------------|
+| 无全局折扣 | 空/0 | 未定义 | 否 | 否（未定义变量被当作 null，`!empty(null)` = false） |
+| 有全局折扣，百分比类型 | 非空，类型=percentage | 定义 = 行金额 × 折扣率% | 是 | 是（加回） |
+| 有全局折扣，固定类型 | 非空，类型=fixed | 定义 = 分摊到该行的折扣额 | 是 | 是（加回） |
+
+**加回逻辑的业务含义：**
+```
+税种计算基数 = 行折扣后金额 - 全局折扣   （基于扣除后的金额算税）
+最终存储 total = 税种计算后金额 + 全局折扣  （加回来，用于行合计显示）
+```
+
+> **结论：全局折扣只影响税种计算的基数，不影响最终行金额（total 字段）。**
+> 全局折扣是在 DocumentTotal 层（汇总层）统一扣减的，而不是在 DocumentItem 层。
+
+#### 4.2.1.2 DocumentItemTax 中 withholding 存储绝对值的机制
+
+**⚠️ 存储时使用 abs() 取绝对值（CreateDocumentItem.php:193）：**
+
+```php
+// Line 130: withholding 计算时是负数
+$tax_amount = -($actual_price_item * ($tax->rate / 100));  // 例: -9.09
+
+// Line 135: $item_taxes[] 中存的是带符号的原始值
+$item_taxes[] = [
+    ...
+    'amount' => $tax_amount,  // 仍然是 -9.09
+];
+
+// Line 139: 累加时用的是带符号值（所以总计会被扣减）
+$item_tax_total += $tax_amount;
+
+// ...
+
+// Line 191-197: 写入数据库时，用 abs() 取绝对值！
+foreach ($item_taxes as $item_tax) {
+    $item_tax['document_item_id'] = $document_item->id;
+    $item_tax['amount'] = round(abs($item_tax['amount']), $precision);
+    //         ^^^^^ 关键！-9.09 变成了 9.09 存入表中
+    
+    DocumentItemTax::create($item_tax);
+}
+```
+
+**两层汇总时的不同处理：**
+
+```
+DocumentItem 层（Line 173）:
+    $this->request['tax'] = round($item_tax_total, $precision);
+    // 这里用的是 $item_tax_total，包含了负数的 withholding
+    // 所以 tax 是 (价内税 + fixed + normal + withholding(负) + compound)
+
+DocumentTotal 层（CreateDocumentItemsAndTotals.php:240-250）:
+    foreach ($document_item->item_taxes as $item_tax) {
+        // ⚠️ item_tax['amount'] 此时是存储在内存中的原始值（带符号）
+        //     因为 Line 187 赋值的是 $item_taxes 原始数组（还没被 abs）
+        //     而 Line 193 只是在 create 时用了 abs，但没有修改内存中的值
+        $taxes[$item_tax['tax_id']]['amount'] += (float) $item_tax['amount'];
+    }
+
+DocumentTotal 存储时（CreateDocumentItemsAndTotals.php:103）:
+    DocumentTotal::create([
+        ...
+        'amount' => round(abs($tax['amount']), $precision),
+        //       ^^^^ 同样用 abs() 存绝对值
+    ]);
+
+DocumentTotal 累加到 amount（CreateDocumentItemsAndTotals.php:109）:
+    $this->request['amount'] += $tax['amount'];
+    // 这里 $tax['amount'] 还是带符号的原始值（-9.09）
+    // 因为 taxes 数组在 L240-250 累加时用的是内存中的原始 item_tax
+```
+
+**withholding 在各层数据中的值对比：**
+
+| 层级 | 字段 | 值（例） | 符号 | 位置 |
+|------|------|---------|------|------|
+| 计算中间值 | `$tax_amount` (withholding) | -9.09 | 负 | CreateDocumentItem.php:130 |
+| 内存数组 `$item_taxes` | `amount` | -9.09 | 负 | CreateDocumentItem.php:135 |
+| DocumentItem 表 | `tax` (合计) | 100 + 10 + 23.64 - 9.09 + 6.74 = **131.29** | 含负 | CreateDocumentItem.php:173 |
+| **document_item_taxes 表** | `amount` | **9.09** | **正（abs）** | CreateDocumentItem.php:193 |
+| DocumentTotal 聚合 `taxes[]` | `amount` | -9.09（累加自内存数组） | 负 | CreateDocumentItemsAndTotals.php:245 |
+| **document_totals 表 (code=tax)** | `amount` | **9.09** | **正（abs）** | CreateDocumentItemsAndTotals.php:103 |
+| DocumentTotal 累加到 `amount` | - | -9.09（影响总计） | 负 | CreateDocumentItemsAndTotals.php:109 |
+| documents 表 | `amount` | 受影响（扣减了 9.09） | 含负 | CreateDocumentItemsAndTotals.php:144 |
+
+> **关键结论：**
+> 1. **存储层**（document_item_taxes 和 document_totals 表）存的是 **绝对值**
+> 2. **计算层**（内存数组、税合计、单据总计）用的是 **带符号值**
+> 3. 这导致一个有趣的现象：表中 withholding 的 amount 是正数，但在最终单据金额计算时它确实是被扣减的
+> 4. 读取展示时需要根据税种类型（withholding）来判断是否显示负号（前端展示逻辑处理）
 
 #### 4.2.2 多税聚合（多税种、多行项目）
 
@@ -285,8 +455,10 @@ calculateTotalsTax(totals_taxes, id, name, price) {
 **后端聚合逻辑（CreateDocumentItemsAndTotals.php:240-250）**
 ```php
 foreach ((array) $document_item->item_taxes as $item_tax) {
+    // ⚠️ 注意：这里的 $item_tax['amount'] 来自 CreateDocumentItem 中 L187
+    //         赋值的内存数组 $item_taxes（带符号，未 abs），不是从数据库读的
     if (array_key_exists($item_tax['tax_id'], $taxes)) {
-        // 已有税种，累加
+        // 已有税种，累加（withholding 为负）
         $taxes[$item_tax['tax_id']]['amount'] += 
             round((float) $item_tax['amount'], $this->document->currency->precision);
     } else {
@@ -306,71 +478,96 @@ foreach ($taxes as $tax) {
     DocumentTotal::create([
         'code' => 'tax',
         'name' => Str::ucfirst($tax['name']),
+        // ⚠️ 存储时取绝对值（withholding -9.09 → 9.09）
         'amount' => round(abs($tax['amount']), $precision),
         'sort_order' => $sort_order++,
     ]);
+    
+    // 但累加到 amount 时用的是带符号的原始值
+    $this->request['amount'] += $tax['amount'];
 }
 ```
 
 **多税聚合示例：**
 ```
-行1: 商品A，数量×单价=100，税种：增值税13% + 消费税5%
-   → 增值税: 13, 消费税: 5
+行1: 商品A，数量×单价=100，税种：增值税13% + 预扣税5%
+   → 增值税: 13, 预扣税: -5
    
 行2: 商品B，数量×单价=200，税种：增值税13% + 复合税2%
    → 增值税: 26, 复合税: (200+26)×2% = 4.52
 
-聚合后 DocumentTotal:
-  - tax (增值税): 13 + 26 = 39
-  - tax (消费税): 5
+内存聚合（带符号）:
+  - 增值税: 13 + 26 = 39
+  - 预扣税: -5
+  - 复合税: 4.52
+
+document_totals 表存储（绝对值）:
+  - tax (增值税): 39
+  - tax (预扣税): 5 (abs)
   - tax (复合税): 4.52
+
+amount 累加（带符号）:
+  amount = 300 (行合计) + 39 + (-5) + 4.52 = 338.52
 ```
 
-#### 4.2.3 复合税完整计算示例
+#### 4.2.3 复合税完整计算示例（含全局折扣 + 加回逻辑）
 
-**场景：** 单价=100，数量=2，行折扣=0，全局折扣=0
-**税种：** 价内税10% + 固定税5/件 + 普通税13% + 预扣税5% + 复合税3%
+**场景：** 
+- 单价=100，数量=2，行折扣=0
+- 全局折扣类型=percentage，折扣率=10%（即该行分摊 20）
+- 税种：价内税10% + 固定税5/件 + 普通税13% + 预扣税5% + 复合税3%
 
 **计算过程：**
 
 ```
 初始：
-  折扣后金额 = 100 × 2 = 200
-  $actual_price_item = $item_amount = $item_discounted_amount = 200
+  基础金额 = 100 × 2 = 200
+  行折扣 = 0
+  全局折扣扣除: global_discount = 200 × 10% = 20
+  $item_discounted_amount = 200 - 0 = 200 → 扣除全局 = 180
+
+Line 60 初始化（扣除全局折扣后的值）：
+  $actual_price_item = $item_amount = $item_discounted_amount = 180
 
 第1步 - 价内税 (inclusive 10%)：
-  税额 = 200 - (200 / (1 + 10/100) = 200 - 181.82 = 18.18
-  $item_tax_total = 18.18
-  $actual_price_item = 200 - 18.18 = 181.82
-  $item_amount 保持 200 不变
+  税额 = 180 - (180 / (1 + 10/100) = 180 - 163.64 = 16.36
+  $item_tax_total = 16.36
+  $actual_price_item = 180 - 16.36 = 163.64
+  ⚠️ $item_amount 保持 180 不变（价内税不影响 compound base）
 
 第2步 - 固定税 (fixed 5/件)：
+  // 数量已由 FormRequest 转换: "2" → (double)2
   税额 = 5 × 2 = 10
-  $item_amount = 200 + 10 = 210
-  $item_tax_total = 18.18 + 10 = 28.18
+  $item_amount = 180 + 10 = 190
+  $item_tax_total = 16.36 + 10 = 26.36
 
 第3步 - 普通税 (normal 13%)：
-  税额 = 181.82 × 13% = 23.64
-  $item_amount = 210 + 23.64 = 233.64
-  $item_tax_total = 28.18 + 23.64 = 51.82
+  税额 = 163.64 × 13% = 21.27
+  $item_amount = 190 + 21.27 = 211.27
+  $item_tax_total = 26.36 + 21.27 = 47.63
 
 第4步 - 预扣税 (withholding 5%)：
-  税额 = -(181.82 × 5%) = -9.09
-  $item_amount = 233.64 - 9.09 = 224.55
-  $item_tax_total = 51.82 - 9.09 = 42.73
+  税额 = -(163.64 × 5%) = -8.18
+  $item_amount = 211.27 - 8.18 = 203.09
+  $item_tax_total = 47.63 - 8.18 = 39.45
 
 第5步 - 复合税 (compound 3%)：
-  ⚠️  base = $item_amount = 224.55 (包含前面所有税！)
-  税额 = 224.55 × 3% = 6.74
-  $item_tax_total = 42.73 + 6.74 = 49.47
+  ⚠️  base = $item_amount = 203.09
+  ( = 全局折扣后金额 180 + fixed 10 + normal 21.27 + withholding -8.18 )
+  ( 不含价内税！因为 $item_amount 在价内税阶段没有被修改 )
+  税额 = 203.09 × 3% = 6.09
+  $item_tax_total = 39.45 + 6.09 = 45.54
+
+Line 158: 全局折扣加回 (global_discount = 20)：
+  $actual_price_item = 163.64 + 20 = 183.64  ← 最终 total
+  $item_amount = 203.09 + 20 = 223.09
+  $item_discounted_amount = 180 + 20 = 200
 
 最终结果：
-  行金额 total = $actual_price_item = 181.82 (折扣后 - 价内税)
-  税合计 tax = 49.47
-  行总计 grand_total = 224.55 + 6.74 = 231.29
+  行金额 total = $actual_price_item = 183.64 (价内税后净价 + 加回全局折扣)
+  税合计 tax = 45.54 (含预扣税的负号影响)
+  DocumentItemTax 表中 withholding 的 amount = abs(-8.18) = 8.18 (正数存储)
 ```
-
-> **关键观察：** 复合税的 base = 224.55 中已经包含了前面的固定税、普通税、预扣税，但不包含价内税（因为价内税已经从 item_amount 中剥离到 actual_price_item 了）。
 
 ### 4.3 全局折扣分摊逻辑
 
@@ -770,7 +967,7 @@ UpdateDocument / CreateDocument 继续执行：
 
 ---
 
-## 八、计算示例（端到端）
+## 九、计算示例（端到端）
 
 **场景：** 创建一张发票，包含一行商品
 

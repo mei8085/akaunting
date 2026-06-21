@@ -779,164 +779,167 @@ ModuleHistory::create([
 
 ---
 
-## 补充章节四：PaymentReceived 付款收到事件链路 — 异步队列派发时序与付款通知漏发风险
+## 补充章节四：PaymentReceived 付款收到事件链路 — 派发模型的同步保证与编排 Job / Notification 设计差异
 
-### 事件注册与监听器属性
-位置：[app/Providers/Event.php#L74-L77](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Providers/Event.php#L74-L77)
+> **重要纠正**：此前版本误将 `should_queue()` 的调度判断理解为"会把编排 Job 推到队列"，进而推断出存在"付款通知静默漏发"的竞态风险。实际上 Laravel Bus 的调度优先级规则决定了：只要 Job 类没显式 `implements ShouldQueue`，不管 `queue.default` 配置什么、不管调用 `dispatch()` 还是 `dispatchSync()`，都会**在当前进程同步执行**。以下为基于代码的正确分析。
 
-```php
-PaymentReceived::class => [
-    CreateDocumentTransaction::class,       // ① 创建银行交易
-    SendDocumentPaymentNotification::class, // ② 发送付款通知（强依赖 ① 的副作用）
-],
-```
+### 关键前提：两个基类、两条命运
 
-**关键前提（决定时序的基础）**：
-- 两个 Listener 类均**未实现 `ShouldQueue` 接口**（grep 全文确认：[CreateDocumentTransaction.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Listeners/Document/CreateDocumentTransaction.php)、[SendDocumentPaymentNotification.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Listeners/Document/SendDocumentPaymentNotification.php) 均只 use Traits，无 implements）
-- 因此 Laravel 事件调度器**按注册顺序在当前进程内同步调用**两个 Listener 的 `handle()`，不会把 Listener 自身推到队列
-- 竞态风险不来自 Listener 调度，而来自**Listener ① 内部的 `$this->dispatch(...)` 调用**
+Akaunting 为 Job 设计了两个不同的抽象基类，决定了调度行为的根本差异：
 
-### dispatch() 内部决策 — should_queue() 函数
-位置：[app/Utilities/helpers.php#L136-L144](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Utilities/helpers.php#L136-L144) + [app/Traits/Jobs.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Traits/Jobs.php)
+| 基类 | `implements ShouldQueue` | 继承关系 | 子类数量 | 调度行为（Laravel Bus 规则） |
+|------|-------------------------|---------|---------|---------------------------|
+| **`App\Abstracts\Job`** | ❌ 否 | `use Jobs, Relationships, Sources, Uploads` | ~88 个（所有核心业务 Job） | **永远同步执行**：Laravel Dispatcher 在 `dispatch()` 内部检查 `$job instanceof ShouldQueue`，不满足则直接 `$this->dispatchNow($job)` 同步执行，即使走了 `dispatchQueue` 代码路径也会在当前进程跑 |
+| **`App\Abstracts\JobShouldQueue`** | ✅ 是 | `use InteractsWithQueue, Queueable, SerializesModels, ...` | 4 个（IO 密集型） | **进入队列异步执行**：由 Queue Worker 进程消费，不阻塞当前 HTTP 请求 |
 
-```php
-// helpers.php
-function should_queue(): bool
-{
-    return ! in_array(config('queue.default'), ['sync', 'null']);
-}
+4 个 `JobShouldQueue` 子类全部是 IO 密集/慢操作：
+- `CreateZipForDownload`（生成压缩包）
+- `CreateMediableForDownload`（文件处理）
+- `CreateMediableForExport`（导出大文件）
+- `NotifyUser`（通用用户通知）
 
-// Jobs Trait 的 dispatch() 决策：
-if (should_queue()) {
-    return dispatch_queue($job);   // dispatchQueue → 推到 Redis/DB 队列，立即返回 PendingDispatch
-} else {
-    return dispatch_sync($job);    // dispatchSync → 当前进程同步执行完再返回
-}
-```
+全项目 grep 结果：`CreateBankingDocumentTransaction`、`CreateTransaction`、`CreateDocumentHistory` 等全部核心 Job **无一例外继承 `Job`，未实现 `ShouldQueue`**。
 
-### 时序一：queue.default = sync（同步模式，开发/单节点默认）—— 一切正常
+### `dispatch()` 的决策树（三层过滤）
+
+`Jobs Trait` 的 `dispatch()` 决策链路（[Traits/Jobs.php#L17-L82](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Traits/Jobs.php#L17-L82) + `should_queue()` 函数 [helpers.php#L136-L144](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Utilities/helpers.php#L136-L144)）：
 
 ```
-进程 A  ── HTTP POST /invoices/123/payment ──►
-  │
-  │ event(new PaymentReceived($document, $request))
-  ▼
-  ├─► [Listener ①] CreateDocumentTransaction::handle()
-  │     │
-  │     │ $this->dispatch(new CreateBankingDocumentTransaction(...))
-  │     │   → should_queue() === false → dispatch_sync
-  │     │
-  │     ├─► [同步执行] CreateBankingDocumentTransaction::handle()
-  │     │     │
-  │     │     ├─► dispatch(new CreateTransaction(...)) → dispatch_sync
-  │     │     │     └─► INSERT transactions 表完成 ✅
-  │     │     │
-  │     │     ├─► $document->paid_amount = xxx; $document->save() 完成 ✅
-  │     │     │
-  │     │     └─► dispatch(new CreateDocumentHistory(...)) → dispatch_sync
-  │     │           └─► INSERT document_histories 表完成 ✅
-  │     │
-  │     └─ 返回 Transaction 对象
-  │
-  ├─► [Listener ②] SendDocumentPaymentNotification::handle()
-  │     │
-  │     │ $event->request['type'] === 'income' ✔（进入发送逻辑）
-  │     │
-  │     │ $transaction = $document->transactions()->latest()->first();
-  │     │   ↑ 事务已在同一 DB 连接中提交，SELECT 能拿到刚 INSERT 的行
-  │     │   ↑ 返回非 null 的 Transaction 实例 ✔
-  │     │
-  │     └─► Notification::sendNow($contact, new PaymentReceived($transaction))
-  │         通知正常发出 ✅
-  │
-  └─ HTTP 200 响应返回
-```
-
-### 时序二：queue.default = redis/database（异步队列模式）—— 静默漏发
-
-```
-进程 A  ── HTTP POST /invoices/123/payment ──►
-  │
-  │ event(new PaymentReceived($document, $request))
-  ▼
-  ├─► [Listener ①] CreateDocumentTransaction::handle()
-  │     │
-  │     │ $this->dispatch(new CreateBankingDocumentTransaction(...))
-  │     │   → should_queue() === true → dispatch_queue
-  │     │   → 向队列 Redis 推一条 Job 消息
-  │     │   → 立即返回 PendingDispatch 对象，handle() 此时**根本没被执行**！
-  │     │   → transactions 表**还没有**这条记录 ❌
-  │     │
-  │     └─ 返回（约 1ms 级别，立即）
-  │
-  ├─► [Listener ②] SendDocumentPaymentNotification::handle()
-  │     │   ← Listener ① 返回后紧接着执行（同一进程，同步顺序）
-  │     │
-  │     │ $event->request['type'] === 'income' ✔
-  │     │
-  │     │ $transaction = $document->transactions()->latest()->first();
-  │     │   ↑ 此时 Queue Worker 可能还没抢到任务，也可能抢到了但还在 INSERT 阶段
-  │     │   ↑ SELECT 返回 null ❌
-  │     │
-  │     │ if (! $transaction) { return; }   // ← 直接 return
-  │     │                                     // ← 无 Log、无 Exception、无 flash
-  │     │
-  │     └─ 静默结束，什么都没发 ❌
-  │
-  └─ HTTP 200 响应返回（用户看起来成功了）
-
-
-         ▓▓▓ 几毫秒到几秒之后 ▓▓▓
-
-  [Queue Worker B] 从 Redis 取出 CreateBankingDocumentTransaction
-     ├─► handle() 正常执行
-     │     ├─► INSERT transactions ✅
-     │     ├─► UPDATE documents.paid_amount ✅
-     │     └─► INSERT document_histories ✅
+Jobs::dispatch($job)
      │
-     └─► Transaction 落盘了，但付款通知**永远不会再触发**（没有 after 补偿逻辑）
+     ▼
+第 1 层：getDispatchFunction()
+  should_queue() = !in_array(config('queue.default'), ['sync', 'null'])
+  ├─ 配置为 sync/null → dispatchSync →  Dispatcher::dispatchSync()
+  └─ 配置为 redis/database → dispatchQueue → Dispatcher::dispatch()
+               │
+               ▼
+第 2 层：Laravel Dispatcher::dispatchNow / dispatchSync / dispatch 内部检查
+  if ($job instanceof ShouldQueue) {
+      // 推入 Redis/DB 队列，由 Worker 异步消费
+      return $this->pushToQueue($job);
+  }
+  // 非 ShouldQueue → 无论走的哪个分支，都同步 run
+  return $this->runJobNow($job);
+               │
+               ▼
+第 3 层：$job->handle() 在当前 PHP 进程、当前请求内同步执行
+  handle() 内部如果再 $this->dispatch(子Job) → 走同样的三层过滤
+  → 全部同步，形成嵌套同步调用栈
 ```
 
-### SendDocumentPaymentNotification 的静默漏发关键代码
-位置：[app/Listeners/Document/SendDocumentPaymentNotification.php#L18-L27](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Listeners/Document/SendDocumentPaymentNotification.php#L18-L27)
+**对核心业务 Job 的最终结果**：不管 queue.default 配 redis 还是 database，`CreateBankingDocumentTransaction`（继承 `Job`，无 `ShouldQueue`）都走第 2 层的"非 ShouldQueue"分支 → 同步执行。**不存在"推到队列另一进程异步执行"的情况。**
 
-```php
-public function handle(Event $event): void
-{
-    // 第一层 guard — 非收入类型（bill）不通知
-    if ($event->request['type'] !== 'income') {
-        return;
-    }
+### 实际同步执行链路（queue.default = redis 或 database 时）
 
-    $document = $event->document;
-    $transaction = $document->transactions()->latest()->first();
-
-    // 第二层 guard — 拿不到交易直接 return
-    if (! $transaction) {
-        return;   // ← 异步模式下 99% 命中这个 return 分支
-    }
-
-    // 只有同步模式下才能走到下面的 Notification::send
-    Notification::send(...);
-}
+```
+HTTP POST /invoices/123/payment
+  进程 A（当前请求进程，PHP-FPM 线程）
+     │
+     ▼
+event(new PaymentReceived($document, $request))
+     │
+     ▼
+[Listener ①] CreateDocumentTransaction::handle()
+  │  同步执行（Listener 本身也未 implements ShouldQueue）
+  │
+  │  $this->dispatch(new CreateBankingDocumentTransaction(...))
+  │    │
+  │    ├─ 第 1 层：should_queue() === true → dispatchQueue
+  │    ├─ 第 2 层：Dispatcher::dispatch() 内部检查
+  │    │     $job = CreateBankingDocumentTransaction
+  │    │     $job instanceof ShouldQueue  →  FALSE ❌
+  │    │     → 不走 pushToQueue
+  │    │     → 直接 $this->runJobNow($job) ←★ 关键 ★
+  │    │
+  │    ▼
+  │  [同步调用] CreateBankingDocumentTransaction::handle()
+  │    │
+  │    ├─ DB::transaction 开始
+  │    │
+  │    ├─ prepareRequest() 组装参数
+  │    │
+  │    ├─ $this->dispatch(new CreateTransaction(...))
+  │    │     │  同样三层过滤：继承 Job → 同步执行
+  │    │     ▼
+  │    │   Transaction::create() 落盘 ✅
+  │    │
+  │    ├─ $document->paid_amount = xxx → $document->save() ✅
+  │    │
+  │    ├─ $this->dispatch(new CreateTransactionTaxes(...))
+  │    │     ▼ 同步 → transaction_taxes 写入 ✅
+  │    │
+  │    ├─ DB::transaction 提交
+  │    │
+  │    └─ $this->dispatch(new CreateDocumentHistory(...))
+  │          ▼ 同步 → document_histories 写入 ✅
+  │
+  │  ← handle() 返回，此时 transactions 表已有该行
+  │
+  ▼
+[Listener ②] SendDocumentPaymentNotification::handle()
+  │   ← Listener ① 返回后紧接着执行（同一进程、同一 DB 连接、同一事务快照之后）
+  │
+  │  if ($event->request['type'] !== 'income') return;
+  │     → 账单（expense）跳过，只通知发票（income）
+  │
+  │  $transaction = $document->transactions()->latest()->first();
+  │     ↑ 同一请求，Listener ① 的同步 handle() 刚刚 INSERT 并提交
+  │     ↑ SELECT 100% 命中非 null 结果
+  │
+  │  if (! $transaction) return;    // 正常流程不会命中
+  │
+  └─ Notification::send(...)
+         │
+         ▼
+       [异步行为从这里才开始]
+         Notification::send() 内部：
+         Notification 抽象类 implements ShouldQueue
+           (Abstracts/Notification.php#L11)
+         $this->onQueue('notifications');
+           (Abstracts/Notification.php#L27)
+         → 推到 notifications 队列
+         → 立即 return，当前进程不阻塞
+         → Queue Worker 异步执行实际 SMTP 发送
 ```
 
-**漏发风险量化**：假设 Queue Worker 平均延迟 50ms（非常优秀的水平），Listener ② 在 Listener ① 返回后 1ms 内执行 —— SELECT 比 INSERT 提前约 49ms，**100% 拿不到**。只有在极端情况下（INSERT 极快、或者 Worker 恰好在 SELECT 前的几微秒内刚好 COMMIT）才会命中，基本等于必漏。
+### 同步保证的设计意图
 
-### 问题根因五层总结
+完整 PaymentReceived 链路中，**哪些同步、哪些异步**，体现了精确的分层设计：
 
-| 层次 | 具体问题 |
-|------|---------|
-| **Listner 耦合设计** | Listener ② 强依赖 Listener ① 的副作用（新 transaction 已在 DB），但两者之间没有 `after_commit` / Promise / await 语义 |
-| **调度不可见** | 同步 Listener 内部通过 `should_queue()` 动态决定 dispatch 模式，调用方完全感知不到时序变化 |
-| **事务边界模糊** | Listener ① 内部的 DB 写入不在 PaymentReceived 的事务范围内（异步模式下根本在另一进程） |
-| **静默失败** | 拿不到 transaction 就 `return;`，没有 `Log::warning()`、没有 `report()`、没有队列延迟重试 |
-| **命名误导** | Listener 命名 `SendDocumentPaymentNotification` 暗示"文档已付款→发通知"，但在异步模式下它的真实语义更接近"如果此刻能找到最新付款交易就发通知" |
+| 执行环节 | 执行方式 | 理由 |
+|---------|---------|------|
+| PaymentReceived 事件调度 | 同步（Listener 未 implements ShouldQueue） | 两 Listener 有隐式数据依赖，需要顺序执行 |
+| Listener ① 内部 CreateBankingDocumentTransaction | 同步（继承 `Job`，非 ShouldQueue） | 事务必须在当前请求内 COMMIT 后才能返回 200，避免用户以为付款成功但实际没写入 |
+| CreateTransaction / CreateDocumentHistory 等子 Job | 同步 | 嵌套子事务需要外层事务控制，异步会打破 ACID |
+| Listener ② 内部逻辑（SELECT + 校验） | 同步 | 快速判断是否需要发送，不构成性能瓶颈 |
+| **Notification 邮件发送** | **异步（Notification 基类 implements ShouldQueue，进入 notifications 队列）** | SMTP 建连 + 发送是慢 IO（几十 ms ~ 几秒），阻塞 HTTP 响应不合理；即使邮件失败也不影响"付款已记录"的核心事务 |
 
-### 修复方向（非本任务范围，仅提示）
-- **方案 A**：把通知逻辑移到 `CreateBankingDocumentTransaction::handle()` 末尾，在同一 DB 事务内，当 Transaction 和 History 都落盘后手动 dispatch（或用 `DB::afterCommit()` 钩子）
-- **方案 B**：让 SendDocumentPaymentNotification 实现 `ShouldQueue` + `->delay(now()->addSeconds(3))`，延迟 3 秒等 Worker 落盘后再查（牺牲实时性）
-- **方案 C**：在 `return;` 前至少 `Log::warning('Payment notification skipped: transaction not found', [...])`，便于事后排查
+### 数据依赖时序的最终结论
+
+| 之前的错误推断 | 实际代码事实 |
+|--------------|-------------|
+| `dispatchQueue()` 会把 `CreateBankingDocumentTransaction` 推到队列 → 异步 → 竞态 | ❌ 错。该 Job 未 `implements ShouldQueue`，Dispatcher 在 `dispatch()` 内部检测后改为同步执行 |
+| Listener ② 查询时拿不到 transaction → 静默漏发 | ❌ 错。Listener ② 执行前 Listener ① 的整个 handle() 同步返回，含所有嵌套子 Job 全部 COMMIT，SELECT 必命中 |
+| 需要修复方案 A/B/C | ❌ 无需修复。三层过滤机制已确保同步顺序正确，竞态根本不存在 |
+| 竞态只在异步队列配置下发生 | ❌ 错。对非 ShouldQueue Job，无论 queue.default 是什么，行为完全一致（同步） |
+
+**唯一"异步"的环节是 Notification 邮件发送**，但这发生在 Listener ② 成功拿到 transaction 实例之后，推到 `notifications` 队列是合理的解耦——邮件失败不影响付款交易的落盘。
+
+### 扩展：两个基类的对比总表
+
+| 维度 | `App\Abstracts\Job` | `App\Abstracts\JobShouldQueue` |
+|------|---------------------|-------------------------------|
+| `implements ShouldQueue` | ❌ | ✅ |
+| `use` Traits | `Jobs, Relationships, Sources, Uploads` | `InteractsWithQueue, Queueable, SerializesModels, Jobs, Relationships, Sources, Uploads` |
+| bootCreate Request 容器 | `Illuminate\Http\Request`（不可序列化） | `App\Utilities\QueueCollection`（可序列化，支持跨进程传输） |
+| 设计用途 | 核心 CRUD、事务编排、状态变更、需要 ACID 的业务逻辑 | 慢 IO、导出压缩、邮件通知、可延迟/可重试的非核心操作 |
+| 典型子类 | CreateDocument、UpdateTransaction、DeleteDocument、CreateBankingDocumentTransaction | CreateZipForDownload、CreateMediableForExport、NotifyUser |
+| 子类数量 | ~88 | 4 |
+| 当前请求响应时间影响 | 直接影响（同步执行耗时计入 HTTP 响应） | 不影响（排队执行） |
+| 失败处理 | 抛异常 + 事务回滚 + 用户看到错误页 | 入队死信 + 记录 failed_jobs 表 + 用户无感知 |
+
+
 
 ---
 

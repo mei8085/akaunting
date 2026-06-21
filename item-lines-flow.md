@@ -326,6 +326,52 @@ foreach ($taxes as $tax) {
   - tax (复合税): 4.52
 ```
 
+#### 4.2.3 复合税完整计算示例
+
+**场景：** 单价=100，数量=2，行折扣=0，全局折扣=0
+**税种：** 价内税10% + 固定税5/件 + 普通税13% + 预扣税5% + 复合税3%
+
+**计算过程：**
+
+```
+初始：
+  折扣后金额 = 100 × 2 = 200
+  $actual_price_item = $item_amount = $item_discounted_amount = 200
+
+第1步 - 价内税 (inclusive 10%)：
+  税额 = 200 - (200 / (1 + 10/100) = 200 - 181.82 = 18.18
+  $item_tax_total = 18.18
+  $actual_price_item = 200 - 18.18 = 181.82
+  $item_amount 保持 200 不变
+
+第2步 - 固定税 (fixed 5/件)：
+  税额 = 5 × 2 = 10
+  $item_amount = 200 + 10 = 210
+  $item_tax_total = 18.18 + 10 = 28.18
+
+第3步 - 普通税 (normal 13%)：
+  税额 = 181.82 × 13% = 23.64
+  $item_amount = 210 + 23.64 = 233.64
+  $item_tax_total = 28.18 + 23.64 = 51.82
+
+第4步 - 预扣税 (withholding 5%)：
+  税额 = -(181.82 × 5%) = -9.09
+  $item_amount = 233.64 - 9.09 = 224.55
+  $item_tax_total = 51.82 - 9.09 = 42.73
+
+第5步 - 复合税 (compound 3%)：
+  ⚠️  base = $item_amount = 224.55 (包含前面所有税！)
+  税额 = 224.55 × 3% = 6.74
+  $item_tax_total = 42.73 + 6.74 = 49.47
+
+最终结果：
+  行金额 total = $actual_price_item = 181.82 (折扣后 - 价内税)
+  税合计 tax = 49.47
+  行总计 grand_total = 224.55 + 6.74 = 231.29
+```
+
+> **关键观察：** 复合税的 base = 224.55 中已经包含了前面的固定税、普通税、预扣税，但不包含价内税（因为价内税已经从 item_amount 中剥离到 actual_price_item 了）。
+
 ### 4.3 全局折扣分摊逻辑
 
 **函数：** `fixedDiscountCalculate()` [CreateDocumentItemsAndTotals.php:265-289](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Jobs/Document/CreateDocumentItemsAndTotals.php#L265-L289)
@@ -434,7 +480,280 @@ $item['global_discount'] = ($for_fixed_discount[$key] / ($for_fixed_discount['to
 
 ---
 
-## 七、关键代码引用速查
+## 七、编辑保存与单独删除行项目的完整联动路径
+
+### 7.1 发票行项目编辑保存的完整链路
+
+**关键设计：编辑时不存在单独保存某一行的 API。** 行项目的编辑修改是通过**提交整张单据**来完成的。
+
+#### 7.1.1 路由与入口
+
+| 模式 | HTTP 方法 | 路由 | Controller 方法 |
+|------|----------|------|----------------|
+| 创建 | POST | `invoices.store` | [Invoices::store](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Http/Controllers/Sales/Invoices.php#L100-L125) |
+| 编辑 | PATCH | `invoices.update` | [Invoices::update](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Http/Controllers/Sales/Invoices.php#L189-L214) |
+
+**路由配置（admin.php:83）**：
+```php
+Route::resource('invoices', 'Sales\Invoices', [
+    'middleware' => ['date.format', 'money', 'dropzone']
+]);
+```
+
+#### 7.1.2 前端提交链路
+
+**表单构建** [content.blade.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/resources/views/components/documents/form/content.blade.php#L4-L31)：
+```blade
+<x-form 
+    id="{{ $formId }}"
+    :route="$formRoute"      // 创建: invoices.store, 编辑: [invoices.update, $invoice->id]
+    method="{{ $formMethod }}" // 创建: POST, 编辑: PATCH
+    :model="$document"
+>
+```
+
+**表单路由自动生成** [ViewComponents.php:704-721](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Traits/ViewComponents.php#L704-L721)：
+```php
+protected function getFormRoute($type, $formRoute, $model = false)
+{
+    $prefix = 'store';
+    $parameters = [];
+    
+    if (! empty($model)) {
+        $prefix = 'update';
+        $parameters = [$model->id];
+    }
+    
+    return (! empty($model)) ? [$route, $model->id] : $route;
+}
+```
+
+**前端提交触发**：
+
+1. 点击「保存」按钮 → `onSubmit()` [global.js:290-292](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/resources/assets/js/mixins/global.js#L290-L292)
+```javascript
+onSubmit() {
+    this.form.submit();
+}
+```
+
+2. 点击「发送」按钮 → `onSubmitViaSendEmail()` [documents.js:884-889](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/resources/assets/js/views/common/documents.js#L884-L889)
+```javascript
+onSubmitViaSendEmail() {
+    this.form['senddocument'] = true;
+    this.send_to = true;
+    this.onSubmit();
+}
+```
+
+#### 7.1.3 后端处理链路（编辑更新）
+
+**Controller 层** [Invoices::update](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Http/Controllers/Sales/Invoices.php#L189-L214)：
+```php
+public function update(Document $invoice, Request $request)
+{
+    $response = $this->ajaxDispatch(new UpdateDocument($invoice, $request));
+    // ...
+}
+```
+
+**Job 层** [UpdateDocument.php:19-87](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Jobs/Document/UpdateDocument.php#L19-L87)：
+```
+UpdateDocument::handle()
+    │
+    ├─ authorize() → 权限校验
+    │
+    ├─ event(new DocumentUpdating)
+    │
+    └─ DB::transaction()
+        │
+        ├─ 1. deleteRelationships($model, ['items', 'item_taxes', 'totals'], true)
+        │   └─ 物理删除所有 DocumentItem / DocumentItemTax / DocumentTotal
+        │
+        ├─ 2. dispatch(new CreateDocumentItemsAndTotals($model, $request))
+        │   ├─ createItems() → 逐行计算 + 生成 DocumentItem
+        │   └─ 按顺序创建 DocumentTotal 记录
+        │
+        ├─ 3. 更新 Document 主表（包括 amount）
+        │
+        └─ event(new DocumentUpdated)
+```
+
+#### 7.1.4 创建时的对比链路
+
+**Job 层** [CreateDocument.php:20-57](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Jobs/Document/CreateDocument.php#L20-L57)：
+```
+CreateDocument::handle()
+    │
+    └─ DB::transaction()
+        │
+        ├─ 1. Document::create() → 创建主表
+        │
+        ├─ 2. dispatch(new CreateDocumentItemsAndTotals($model, $request))
+        │   └─ 与编辑时完全相同的计算逻辑
+        │
+        └─ 3. $model->update() → 用计算后的 amount 更新主表
+```
+
+> **注意**：创建和编辑都会调用同一个 `CreateDocumentItemsAndTotals` Job，区别是编辑前多了一步 `deleteRelationships`。
+
+### 7.2 单独删除行项目的联动路径
+
+**系统没有单独删除某一行项目的 API。** 删除行项目分两个阶段：
+
+#### 7.2.1 阶段一：前端临时删除（未持久化）
+
+**触发**：点击行项目右上角的 × 按钮 → `onDeleteItem(index)` [documents.js:690-695](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/resources/assets/js/views/common/documents.js#L690-L695)
+
+```javascript
+onDeleteItem(index) {
+    // 从 Vue 响应式数组中移除
+    this.items.splice(index, 1);           // UI 显示用
+    this.form.items.splice(index, 1);      // 表单提交用
+    
+    // 触发全局重算
+    this.onCalculateTotal();
+}
+```
+
+**即时效果**：
+1. UI 上该行消失
+2. `this.totals` 重新计算（sub_total / taxes / total 等实时更新）
+3. **但数据库尚未改变**，只是前端内存中的变化
+
+#### 7.2.2 阶段二：后端真正删除（提交保存后）
+
+用户点击「保存」后，后端通过**全删全插**策略实现删除：
+
+```
+UpdateDocument Job
+    │
+    ├─ deleteRelationships(model, ['items', 'item_taxes', 'totals'], true)
+    │   └─ 删除数据库中该单据的所有 DocumentItem（包括未删除的）
+    │
+    └─ CreateDocumentItemsAndTotals
+        └─ 根据前端提交的 form.items（已不含被删除行）
+           └─ 重新创建所有 DocumentItem
+```
+
+**结果**：未出现在 `form.items` 中的行项目，在新的 DocumentItem 表中就不存在了，相当于被删除。
+
+### 7.3 DocumentTotal 刷新机制详解
+
+`DocumentTotal` 记录不是增量更新，而是**每次保存时全部删除并重新创建**。
+
+#### 7.3.1 创建顺序与 sort_order
+
+**文件：** [CreateDocumentItemsAndTotals.php:29-157](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Jobs/Document/CreateDocumentItemsAndTotals.php#L29-L157)
+
+DocumentTotal 按固定顺序创建，`sort_order` 从 1 开始递增：
+
+| sort_order | code | 说明 | 计算来源 |
+|-----------|------|------|---------|
+| 1 | `sub_total` | 小计 | Σ(price × quantity) 所有行 |
+| 2 | `item_discount` | 行折扣汇总 | Σ 各行行折扣金额（>0 才创建） |
+| 3 | `discount` | 全局折扣 | 全局折扣（有 discount 才创建） |
+| 4...N-2 | `tax` | 按税种分组的税额 | 每个税种一条，按税种聚合 |
+| N-1 | `extra` | 额外费用（运费等） | `$request['totals']` 中的自定义项 |
+| N | `total` | 最终总计 | 以上各项加减后的结果 |
+
+#### 7.3.2 金额累加逻辑（$this->request['amount']）
+
+```php
+// 初始化
+$this->request['amount'] = 0;
+
+// 1. 加上所有行的折后金额（不含税）
+$this->request['amount'] += $actual_total;
+
+// 2. 加上所有税种金额（withholding 为负）
+foreach ($taxes as $tax) {
+    $this->request['amount'] += $tax['amount'];
+}
+
+// 3. 加上额外费用（按 operator 判断加减）
+if (empty($total['operator']) || $total['operator'] == 'addition') {
+    $this->request['amount'] += $total['amount'];
+} else {
+    $this->request['amount'] -= $total['amount'];
+}
+
+// 4. 最终结果写入 DocumentTotal (code=total)
+$this->request['amount'] = round($this->request['amount'], $precision);
+```
+
+#### 7.3.3 DocumentTotal 与 Document.amount 的关系
+
+```
+CreateDocumentItemsAndTotals 执行中：
+    ├─ 创建所有 DocumentTotal 记录
+    ├─ $this->request['amount'] = 最终 total 值
+    │
+UpdateDocument / CreateDocument 继续执行：
+    └─ $this->model->update($this->request->all())
+        └─ Document.amount 被更新为 $this->request['amount']
+```
+
+> **结论**：`Document.amount` 等于 `DocumentTotal` 表中 `code='total'` 的那条记录的 `amount` 字段。
+
+### 7.4 编辑保存完整时序图
+
+```
+[前端] 用户修改行项目（数量/价格/税/折扣，或增删行）
+    │
+    ├─ 触发 onCalculateTotal()
+    │   └─ this.totals / form.items 实时更新
+    │
+    ▼
+[前端] 用户点击「保存」按钮
+    │
+    ├─ onSubmit() → form.submit()
+    │
+    ▼
+[前端] AJAX 提交整张表单 (PATCH /invoices/{id})
+    └─ form.items 数组（已增删改后的完整数据）
+    │
+    ▼
+[后端] FormRequest 验证
+    └─ calculation_to_quantity() 转换数量表达式
+    │
+    ▼
+[后端] Invoices::update()
+    └─ dispatch(new UpdateDocument($invoice, $request))
+    │
+    ▼
+[后端] UpdateDocument Job (事务内)
+    │
+    ├─ 1. deleteRelationships(['items', 'item_taxes', 'totals'], true)
+    │   ├─ DELETE FROM document_items WHERE document_id = ?
+    │   ├─ DELETE FROM document_item_taxes WHERE document_id = ?
+    │   └─ DELETE FROM document_totals WHERE document_id = ?
+    │
+    ├─ 2. dispatch(new CreateDocumentItemsAndTotals)
+    │   │
+    │   ├─ createItems()
+    │   │   └─ 遍历 form.items，为每行调用 CreateDocumentItem
+    │   │       ├─ 计算金额/折扣/税
+    │   │       ├─ INSERT INTO document_items
+    │   │       └─ INSERT INTO document_item_taxes
+    │   │
+    │   └─ 按 sort_order 创建 DocumentTotal
+    │       ├─ INSERT INTO document_totals (code='sub_total')
+    │       ├─ INSERT INTO document_totals (code='item_discount')
+    │       ├─ INSERT INTO document_totals (code='discount')
+    │       ├─ INSERT INTO document_totals (code='tax', ...) × N
+    │       └─ INSERT INTO document_totals (code='total')
+    │
+    └─ 3. UPDATE documents SET amount = ?, ... WHERE id = ?
+    │
+    ▼
+[完成] 事务提交，返回 JSON 响应
+    └─ 前端跳转到 invoices.show 页面
+```
+
+---
+
+## 八、关键代码引用速查
 
 | 功能 | 文件 | 行号 |
 |-----|------|------|

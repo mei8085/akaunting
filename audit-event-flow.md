@@ -246,10 +246,22 @@ abstract class Observer
 }
 ```
 
-`akaunting/laravel-mutable-observer` 包的 `Mutable` Trait 提供的能力（根据类名和使用方式推断）：
-- 允许观察者的方法在运行时被修改/装饰（Mutable = 可变）
-- 可能用于支持模块动态地向已有观察者追加逻辑
-- **注意**：vendor 目录不存在，此包源码未安装
+`akaunting/laravel-mutable-observer` 包的 `Mutable` Trait 提供的能力（来自 GitHub 仓库分析）：
+
+- 通过服务容器代理模式实现 Observer 的**运行时静音**，而不是方法修改
+- 被 `Mutable` trait 装饰的 Observer 类获得 `mute()` / `unmute()` 两个**静态方法**
+- 原理：将 Laravel 容器中已绑定的观察者实例替换为一个代理，代理检查当前事件名是否在"静音列表"里，命中则吞掉调用
+
+**调用方与被调用方的关系（极易混淆）**：
+
+| 概念 | 类 | 位置 |
+|------|-----|------|
+| **被观察的 Eloquent 模型** | `App\Models\Banking\Transaction` | [app/Models/Banking/Transaction.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Models/Banking/Transaction.php) |
+| **观察模型事件的 Observer 类** | `App\Observers\Transaction` | [app/Observers/Transaction.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Observers/Transaction.php) |
+| **注册绑定时** | `Transaction::observe('App\Observers\Transaction')`（这里 Transaction 是 Model 类） | [app/Providers/Observer.php#L27](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Providers/Observer.php#L27) |
+| **调用 mute 时** | `use App\Observers\Transaction; Transaction::mute()`（这里 Transaction 是 Observer 类！） | [app/Jobs/Document/DeleteDocument.php#L9-L22](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Jobs/Document/DeleteDocument.php#L9-L22) |
+
+**关键证据**：DeleteDocument 顶部用了 `use App\Observers\Transaction;`（Observer 类），而不是 Banking Model。这是 PHP 命名空间同名类「覆盖导入」的典型用法。
 
 ### 典型观察者：Transaction Observer
 位置：[app/Observers/Transaction.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Observers/Transaction.php#L23-L79)

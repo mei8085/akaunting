@@ -611,7 +611,7 @@ DeleteDocument::handle()
                ↓
              在一个事务里：
                1. 先删了 histories 表（deleteRelationships 做的）
-               2. 又想 Insert 一条 DocumentHistory ← 外键或逻辑错乱！
+               2. 又想 Insert 一条 DocumentHistory <- 先删后插入孤岛数据，且 histories 已软删，这条也查不到！
 ```
 
 **Mute 的本质**：告诉 Observer「这次删除是上层业务明确发起的级联删除，不需要你做补偿逻辑」。
@@ -640,19 +640,29 @@ Transaction::unmute();                // 恢复所有
 
 #### 步骤一：为什么 DocumentDeleted 不注册监听器？
 
-因为在 `deleteRelationships` 中，**`histories` 关联已经被一起软删除了**！
+核心原因：**此时整个单据生态都已经被级联软删了，再写一条 DocumentHistory 既技术上没有障碍，但业务上完全没有意义，且查不到。**
 
-代码证据（[DeleteDocument.php#L24-L26](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Jobs/Document/DeleteDocument.php#L24-L26)）：
+逐一拆解：
+
+**1. 外键约束 — 不存在**
+迁移定义（[2019_11_16_000000_core_v2.php#L144-L159](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/database/migrations/2019_11_16_000000_core_v2.php#L144-L159)）：
 ```php
-$this->deleteRelationships($this->model, [
-    'items', 'item_taxes', 'histories', 'transactions', 'recurring', 'totals'
-    //               ^^^^^^^^^—— 历史本身被删除了
-]);
+$table->unsignedInteger('document_id');  // 只是整型字段
+$table->index('document_id');            // 只有普通索引
+// 没有 $table->foreign('document_id')->references('id')->on('documents')
 ```
+整个项目里，`document_histories.document_id` **没有任何外键约束**（grep 全迁移文件，外键只用于 `transaction_splits.split_id`、`roles_permissions` 等少数几处）。所以"软删 document 导致外键约束报错"的说法不成立。
 
-此时如果在 DocumentDeleted 的监听器里写 `CreateDocumentHistory`，就会遇到：
-- 外键约束问题（document 本身被软删了，但 document_id 外键仍然指向它，取决于数据库设置）
-- 逻辑荒谬：给一条被整体删除的单据再追加一条"它被删了"的历史，而查询时因为 SoftDeletes Scope 根本看不到 document，也看不到它的 histories
+**2. SoftDeletes 对 INSERT 无影响**
+`App\Abstracts\Model` 基类 `use SoftDeletes`（[Abstracts/Model.php#L23](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Abstracts/Model.php#L23)），Document 和 DocumentHistory 都继承了它。但 SoftDeletes 的本质只是给 SELECT/UPDATE/DELETE 自动追加 `WHERE deleted_at IS NULL`，对 INSERT 新记录**完全没有限制**。所以就算 document 已被软删，往 `document_histories` 表插一条带同样 `document_id` 的新记录在数据库层面不会报任何错。
+
+**3. 真正的问题：写了白写 + 语义无意义**
+
+- **查不到**：DocumentHistory 的 `document()` 关联定义是 `belongsTo(Document::class)->withoutGlobalScope(Company::class)`（[DocumentHistory.php#L17-L20](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Models/Document/DocumentHistory.php#L17-L20)），没有 `withTrashed()`，所以从 history 反向查 document 会返回 null。反过来从 `$document->histories` 查询时，document 本身被 SoftDeletes 过滤，正常查询根本拿不到 document，更看不到它的 histories。即便手动 `withTrashed()` 把 document 捞出来，`histories` 关联也只会返回 `deleted_at IS NULL` 的记录 —— 而 `deleteRelationships` 已经把之前所有 history 都软删了。
+
+- **语义无意义**：DeleteDocument 执行的是「整个单据的软删除」，不仅删 documents 表一行，还通过 `deleteRelationships`（[Relationships.php#L41-L69](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Traits/Relationships.php#L41-L69)）把 items、item_taxes、histories、transactions、recurring、totals **六个关联全部逐条 `->delete()` 软删**。此时再插一条"单据已被删除"的 history，等于是往一堆 soft deleted 的数据孤岛里再加一条孤岛 —— 想完整恢复这张单据需要把 7 张表全部 `restore()`，单独留一条 history 毫无作用，反而让"恢复"逻辑更困惑（要不要把这条新 history 也算进去？）。
+
+- **与 Akaunting 的审计哲学一致**：如前文所述，Akaunting 不做"所有模型变更都记 diff"的通用审计，删除单据属于「物理/软删除」范畴，交给 `deleted_at` + 服务器日志 + binlog 追溯，不在业务层的 DocumentHistory 里体现。
 
 #### 步骤二：那如何追溯"谁删了这张单据"？
 
@@ -769,6 +779,504 @@ ModuleHistory::create([
 
 ---
 
+## 补充章节四：PaymentReceived 付款收到事件链路 — 异步队列派发时序与付款通知漏发风险
+
+### 事件注册与监听器属性
+位置：[app/Providers/Event.php#L74-L77](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Providers/Event.php#L74-L77)
+
+```php
+PaymentReceived::class => [
+    CreateDocumentTransaction::class,       // ① 创建银行交易
+    SendDocumentPaymentNotification::class, // ② 发送付款通知（强依赖 ① 的副作用）
+],
+```
+
+**关键前提（决定时序的基础）**：
+- 两个 Listener 类均**未实现 `ShouldQueue` 接口**（grep 全文确认：[CreateDocumentTransaction.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Listeners/Document/CreateDocumentTransaction.php)、[SendDocumentPaymentNotification.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Listeners/Document/SendDocumentPaymentNotification.php) 均只 use Traits，无 implements）
+- 因此 Laravel 事件调度器**按注册顺序在当前进程内同步调用**两个 Listener 的 `handle()`，不会把 Listener 自身推到队列
+- 竞态风险不来自 Listener 调度，而来自**Listener ① 内部的 `$this->dispatch(...)` 调用**
+
+### dispatch() 内部决策 — should_queue() 函数
+位置：[app/Utilities/helpers.php#L136-L144](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Utilities/helpers.php#L136-L144) + [app/Traits/Jobs.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Traits/Jobs.php)
+
+```php
+// helpers.php
+function should_queue(): bool
+{
+    return ! in_array(config('queue.default'), ['sync', 'null']);
+}
+
+// Jobs Trait 的 dispatch() 决策：
+if (should_queue()) {
+    return dispatch_queue($job);   // dispatchQueue → 推到 Redis/DB 队列，立即返回 PendingDispatch
+} else {
+    return dispatch_sync($job);    // dispatchSync → 当前进程同步执行完再返回
+}
+```
+
+### 时序一：queue.default = sync（同步模式，开发/单节点默认）—— 一切正常
+
+```
+进程 A  ── HTTP POST /invoices/123/payment ──►
+  │
+  │ event(new PaymentReceived($document, $request))
+  ▼
+  ├─► [Listener ①] CreateDocumentTransaction::handle()
+  │     │
+  │     │ $this->dispatch(new CreateBankingDocumentTransaction(...))
+  │     │   → should_queue() === false → dispatch_sync
+  │     │
+  │     ├─► [同步执行] CreateBankingDocumentTransaction::handle()
+  │     │     │
+  │     │     ├─► dispatch(new CreateTransaction(...)) → dispatch_sync
+  │     │     │     └─► INSERT transactions 表完成 ✅
+  │     │     │
+  │     │     ├─► $document->paid_amount = xxx; $document->save() 完成 ✅
+  │     │     │
+  │     │     └─► dispatch(new CreateDocumentHistory(...)) → dispatch_sync
+  │     │           └─► INSERT document_histories 表完成 ✅
+  │     │
+  │     └─ 返回 Transaction 对象
+  │
+  ├─► [Listener ②] SendDocumentPaymentNotification::handle()
+  │     │
+  │     │ $event->request['type'] === 'income' ✔（进入发送逻辑）
+  │     │
+  │     │ $transaction = $document->transactions()->latest()->first();
+  │     │   ↑ 事务已在同一 DB 连接中提交，SELECT 能拿到刚 INSERT 的行
+  │     │   ↑ 返回非 null 的 Transaction 实例 ✔
+  │     │
+  │     └─► Notification::sendNow($contact, new PaymentReceived($transaction))
+  │         通知正常发出 ✅
+  │
+  └─ HTTP 200 响应返回
+```
+
+### 时序二：queue.default = redis/database（异步队列模式）—— 静默漏发
+
+```
+进程 A  ── HTTP POST /invoices/123/payment ──►
+  │
+  │ event(new PaymentReceived($document, $request))
+  ▼
+  ├─► [Listener ①] CreateDocumentTransaction::handle()
+  │     │
+  │     │ $this->dispatch(new CreateBankingDocumentTransaction(...))
+  │     │   → should_queue() === true → dispatch_queue
+  │     │   → 向队列 Redis 推一条 Job 消息
+  │     │   → 立即返回 PendingDispatch 对象，handle() 此时**根本没被执行**！
+  │     │   → transactions 表**还没有**这条记录 ❌
+  │     │
+  │     └─ 返回（约 1ms 级别，立即）
+  │
+  ├─► [Listener ②] SendDocumentPaymentNotification::handle()
+  │     │   ← Listener ① 返回后紧接着执行（同一进程，同步顺序）
+  │     │
+  │     │ $event->request['type'] === 'income' ✔
+  │     │
+  │     │ $transaction = $document->transactions()->latest()->first();
+  │     │   ↑ 此时 Queue Worker 可能还没抢到任务，也可能抢到了但还在 INSERT 阶段
+  │     │   ↑ SELECT 返回 null ❌
+  │     │
+  │     │ if (! $transaction) { return; }   // ← 直接 return
+  │     │                                     // ← 无 Log、无 Exception、无 flash
+  │     │
+  │     └─ 静默结束，什么都没发 ❌
+  │
+  └─ HTTP 200 响应返回（用户看起来成功了）
+
+
+         ▓▓▓ 几毫秒到几秒之后 ▓▓▓
+
+  [Queue Worker B] 从 Redis 取出 CreateBankingDocumentTransaction
+     ├─► handle() 正常执行
+     │     ├─► INSERT transactions ✅
+     │     ├─► UPDATE documents.paid_amount ✅
+     │     └─► INSERT document_histories ✅
+     │
+     └─► Transaction 落盘了，但付款通知**永远不会再触发**（没有 after 补偿逻辑）
+```
+
+### SendDocumentPaymentNotification 的静默漏发关键代码
+位置：[app/Listeners/Document/SendDocumentPaymentNotification.php#L18-L27](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Listeners/Document/SendDocumentPaymentNotification.php#L18-L27)
+
+```php
+public function handle(Event $event): void
+{
+    // 第一层 guard — 非收入类型（bill）不通知
+    if ($event->request['type'] !== 'income') {
+        return;
+    }
+
+    $document = $event->document;
+    $transaction = $document->transactions()->latest()->first();
+
+    // 第二层 guard — 拿不到交易直接 return
+    if (! $transaction) {
+        return;   // ← 异步模式下 99% 命中这个 return 分支
+    }
+
+    // 只有同步模式下才能走到下面的 Notification::send
+    Notification::send(...);
+}
+```
+
+**漏发风险量化**：假设 Queue Worker 平均延迟 50ms（非常优秀的水平），Listener ② 在 Listener ① 返回后 1ms 内执行 —— SELECT 比 INSERT 提前约 49ms，**100% 拿不到**。只有在极端情况下（INSERT 极快、或者 Worker 恰好在 SELECT 前的几微秒内刚好 COMMIT）才会命中，基本等于必漏。
+
+### 问题根因五层总结
+
+| 层次 | 具体问题 |
+|------|---------|
+| **Listner 耦合设计** | Listener ② 强依赖 Listener ① 的副作用（新 transaction 已在 DB），但两者之间没有 `after_commit` / Promise / await 语义 |
+| **调度不可见** | 同步 Listener 内部通过 `should_queue()` 动态决定 dispatch 模式，调用方完全感知不到时序变化 |
+| **事务边界模糊** | Listener ① 内部的 DB 写入不在 PaymentReceived 的事务范围内（异步模式下根本在另一进程） |
+| **静默失败** | 拿不到 transaction 就 `return;`，没有 `Log::warning()`、没有 `report()`、没有队列延迟重试 |
+| **命名误导** | Listener 命名 `SendDocumentPaymentNotification` 暗示"文档已付款→发通知"，但在异步模式下它的真实语义更接近"如果此刻能找到最新付款交易就发通知" |
+
+### 修复方向（非本任务范围，仅提示）
+- **方案 A**：把通知逻辑移到 `CreateBankingDocumentTransaction::handle()` 末尾，在同一 DB 事务内，当 Transaction 和 History 都落盘后手动 dispatch（或用 `DB::afterCommit()` 钩子）
+- **方案 B**：让 SendDocumentPaymentNotification 实现 `ShouldQueue` + `->delay(now()->addSeconds(3))`，延迟 3 秒等 Worker 落盘后再查（牺牲实时性）
+- **方案 C**：在 `return;` 前至少 `Log::warning('Payment notification skipped: transaction not found', [...])`，便于事后排查
+
+---
+
+## 补充章节五：Banking 模块三个核心 Transaction Job 的 HasOwner / HasSource 实现矩阵
+
+### 前置：Banking Transaction 类家族的调用关系图
+
+```
+                       ┌──────────────────────────────────────┐
+                       │  外部入口（Listener / Controller 等） │
+                       └─────────────┬────────────────────────┘
+                                     │
+                                     ▼
+                   CreateBankingDocumentTransaction  (编排层)
+                      implements ShouldCreate  ✅
+                      implements HasOwner      ❌
+                      implements HasSource     ❌
+                                     │
+                                     │  内部 $this->dispatch(...)
+                                     ▼
+                          CreateTransaction  (落盘层)
+                             implements ShouldCreate  ✅
+                             implements HasOwner      ✅
+                             implements HasSource     ✅
+                                     │
+                                     │  内部 $this->dispatch(...)
+                                     ▼
+                       CreateTransactionTaxes  (子实体层)
+                          implements ShouldCreate  ✅
+                          implements HasOwner      ✅
+                          implements HasSource     ✅
+```
+
+### 核心三 Job 实现矩阵
+
+| 维度 | **CreateTransaction** | **CreateBankingDocumentTransaction** | **CreateTransactionTaxes** |
+|------|---------------------|--------------------------------------|--------------------------|
+| 代码文件 | [app/Jobs/Banking/CreateTransaction.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Jobs/Banking/CreateTransaction.php#L8-L14) | [app/Jobs/Banking/CreateBankingDocumentTransaction.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Jobs/Banking/CreateBankingDocumentTransaction.php#L11-L17) | [app/Jobs/Banking/CreateTransactionTaxes.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Jobs/Banking/CreateTransactionTaxes.php#L6-L13) |
+| `implements ShouldCreate` | ✅ 是 | ✅ 是 | ✅ 是 |
+| `implements HasOwner` | ✅ 是 | ❌ 否 | ✅ 是 |
+| `implements HasSource` | ✅ 是 | ❌ 否 | ✅ 是 |
+| `implements ShouldUpdate` | ❌ 否 | ❌ 否 | ❌ 否 |
+| 继承链 | extends Job | extends Job | extends Job |
+| 角色定位 | **落盘层**：最终 INSERT transactions 表 | **编排层**：组装参数、校验金额、更新单据状态、写历史 | **子实体层**：INSERT transaction_taxes 表 |
+| bootCreate 阶段行为 | `setOwner()` 注入 `created_by`，`setSource()` 注入 `created_from` 到 `$this->request` | 仅做 arguments 识别和 Request 转换，**不注入归属字段** | 同 CreateTransaction |
+| 归属字段注入方式 | **直接注入**：bootCreate() → merge 进 request | **委托注入**：本 Job 不处理，内部 dispatch `CreateTransaction` 时由它的 bootCreate() 二次注入 | **直接注入** |
+| 主要调用者 | CreateBankingDocumentTransaction 内部、CreateTransfer 内部、CreateReconciliation 内部、直接调用（手动建收支） | Listener `CreateDocumentTransaction`（PaymentReceived 事件触发） | CreateTransaction 内部 handle 末尾 |
+| created_by / created_from 覆盖可能性 | ✅ 调用方可以在传入 request 时预先设置，HasOwner/HasSource 会跳过已存在的键 | ❌ 编排层本身不可覆盖，但可通过设置传给内部 CreateTransaction 的 request 实现 | ✅ 同 CreateTransaction |
+
+### 设计动机解读（编排层不落盘，不归因）
+
+三个 Job 的接口差异遵循一条核心原则：**谁最终执行 Model::create() 落盘，谁负责归因（记录 created_by/created_from）**。
+
+具体到三 Job：
+1. `CreateBankingDocumentTransaction` 的职责是**业务编排**——校验付款金额与单据金额匹配、更新 `$document->status`（partial/paid）、写付款的 DocumentHistory。它自己不执行 `Transaction::create()`，所以不需要归因。
+2. `CreateTransaction` 的职责是**执行落盘**——真正跑 `Transaction::create($request)`，因此必须实现 HasOwner + HasSource。
+3. 编排层把 `$this->request` 原样传给落盘层时，落盘层的 `setOwner()` 里有 `if ($request->has('created_by')) return;` 的跳过逻辑，所以编排层**可以主动预先设置**特定 created_by（如导入场景指定历史付款人），此时落盘层不会覆盖；反之如果编排层什么都不设，落盘层会自动填入当前 user_id()。
+
+### Banking 模块其它 Job 的接口情况（验证规律普适性）
+
+| Job 类名 | 类型 | ShouldCreate | ShouldUpdate | ShouldDelete | HasOwner | HasSource |
+|---------|------|:------------:|:------------:|:------------:|:--------:|:---------:|
+| CreateTransfer | 创建 | ✅ | ❌ | ❌ | ✅ | ✅ |
+| CreateAccount | 创建 | ✅ | ❌ | ❌ | ✅ | ✅ |
+| CreateReconciliation | 创建 | ✅ | ❌ | ❌ | ✅ | ✅ |
+| UpdateTransaction | 更新 | ❌ | ✅ | ❌ | ❌ | ❌ |
+| UpdateTransfer | 更新 | ❌ | ✅ | ❌ | ❌ | ❌ |
+| UpdateBankingDocumentTransaction | 更新 | ❌ | ✅ | ❌ | ❌ | ❌ |
+| UpdateAccount | 更新 | ❌ | ✅ | ❌ | ❌ | ❌ |
+| UpdateReconciliation | 更新 | ❌ | ✅ | ❌ | ❌ | ❌ |
+| SplitTransaction | 更新 | ❌ | ✅ | ❌ | ❌ | ❌ |
+| DeleteTransaction | 删除 | ❌ | ❌ | ✅ | ❌ | ❌ |
+| DeleteTransfer | 删除 | ❌ | ❌ | ✅ | ❌ | ❌ |
+| DeleteAccount | 删除 | ❌ | ❌ | ✅ | ❌ | ❌ |
+| DeleteReconciliation | 删除 | ❌ | ❌ | ✅ | ❌ | ❌ |
+
+**规律 100% 成立**：创建型 Job = ShouldCreate + HasOwner + HasSource 三件套；更新/删除型 Job = ShouldUpdate/ShouldDelete 单独存在，不处理归属字段（保留创建时的原值）。
+
+---
+
+## 补充章节六：DocumentSent 与 DocumentMarkedSent 的事件分流 — 触发位置与描述分流
+
+### 分流的业务语义背景
+
+"单据已发送"在 ERP 产品中有两种本质不同的业务含义，Akaunting 用两个事件区分：
+
+| 事件类 | 业务语义 | 可信度 | 典型触发场景 |
+|--------|---------|--------|------------|
+| **DocumentSent** | 系统刚刚通过 SMTP/Mail driver 把邮件**投递到 MTA**（发出了） | 高（系统行为，可验证） | 用户点"发送"按钮 → 系统调用 `notify()` 成功后触发；循环单据自动发送 |
+| **DocumentMarkedSent** | 用户表示"我已经通过某种方式发给客户了"（不管用什么方式） | 低（用户声明，不可验证） | 批量操作菜单勾选多张 → 点击"标记为已发送" |
+
+两种语义的最终效果在**状态字段**上相同（都把 `documents.status` 改成 `sent`），但**审计历史**必须区分——这就是事件分流的根本原因。
+
+### 各事件的具体触发位置（按事件类聚合）
+
+#### 事件 A：`DocumentSent` — 邮件真的发出了
+
+**触发点 1**：标准单据发送 Job
+位置：[app/Jobs/Document/SendDocument.php#L26](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Jobs/Document/SendDocument.php#L26)
+
+```php
+// SendDocument::handle()
+if ($this->document->contact && $this->document->contact->email) {
+    $this->document->contact->notify(
+        new DocumentSent($this->document)   // Laravel Notification 发送邮件
+    );
+}
+event(new DocumentSent($this->document));   // 邮件发完才触发事件
+// ↑ 注意：即使 contact->email 为空（没有收件人），也会触发事件
+```
+
+**触发点 2**：自定义内容邮件发送 Job
+位置：[app/Jobs/Document/SendDocumentAsCustomMail.php#L65](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Jobs/Document/SendDocumentAsCustomMail.php#L65)
+
+```php
+// SendDocumentAsCustomMail::handle()
+Notification::route('mail', $request->to_address)
+    ->notify(new CustomDocument($this->document, $request));
+event(new DocumentSent($this->document));   // 自定义邮件成功发出后触发
+```
+
+**触发点 3**：循环单据自动通知（动态事件类名）
+位置：[app/Listeners/Document/SendDocumentRecurringNotification.php#L40-L42](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Listeners/Document/SendDocumentRecurringNotification.php#L40-L42)
+
+```php
+$event_class = config('type.' . $document->type . '.event.sent', DocumentSent::class);
+event(new $event_class($document));
+// ↑ 从配置文件动态读取事件类，默认就是 DocumentSent
+//   这样模块可以自定义自己的 sent 事件
+```
+
+#### 事件 B：`DocumentMarkedSent` — 用户手动标记了
+
+**触发点 1**：销售发票批量操作
+位置：[app/BulkActions/Sales/Invoices.php#L108-L113](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/BulkActions/Sales/Invoices.php#L108-L113)
+
+```php
+// Invoices::sent() 方法
+$invoices = Invoice::whereIn('id', $request->get('selected'))->cursor();
+foreach ($invoices as $invoice) {
+    if (in_array($invoice->status, ['partial', 'paid'])) continue;
+    event(new DocumentMarkedSent($invoice));
+}
+```
+
+**触发点 2**：采购账单批量操作
+位置：[app/BulkActions/Purchases/Bills.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/BulkActions/Purchases/Bills.php) 的 `received()` 方法（结构完全相同，只是事件是 `DocumentReceived` 而非 `DocumentMarkedSent`——因为账单的"标记已收到"语义对应 Received 事件，不是 MarkedSent）
+
+**设计观察**：Sales 端有"标记已发送"（给客户），Purchases 端对称的是"标记已收到"（从供应商收到）。所以 Purchases 没有 `DocumentMarkedSent`，只有 `DocumentReceived`。
+
+### 合流：同一个 Listener 处理两个事件
+
+事件服务提供者注册（[app/Providers/Event.php#L78-L83](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Providers/Event.php#L78-L83)）：
+```php
+DocumentMarkedSent::class => [ MarkDocumentSent::class ],
+DocumentSent::class       => [ MarkDocumentSent::class ],
+// 同一个 Listener 类绑定到两个不同事件
+```
+
+#### Listener 内部的"事件合流 → 描述分流"机制
+位置：[app/Listeners/Document/MarkDocumentSent.php#L10-L45](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Listeners/Document/MarkDocumentSent.php#L10-L45)
+
+```php
+class MarkDocumentSent
+{
+    // ★ PHP 8 联合类型：handle 方法的 $event 形参接受两种事件类
+    public function handle(DocumentMarkedSent|DocumentSent $event): void
+    {
+        $document = $event->document;
+
+        // 合流部分（两事件逻辑相同）
+        if (! in_array($document->status, ['partial', 'paid'])) {
+            $document->status = 'sent';
+            $document->save();
+        }
+
+        // 描述生成时再次分流
+        $this->dispatch(new CreateDocumentHistory(
+            $document, 0, $this->getDescription($event)
+            //                        ^^^^^^^^^^^^^^^^^^^^—— 在这里按事件类型区分
+        ));
+    }
+
+    // ★ 真正的二次分流点
+    protected function getDescription(DocumentMarkedSent|DocumentSent $event): string
+    {
+        $type_text = match($event->document->type) {
+            Document::INVOICE_TYPE  => trans_choice('general.invoices', 1),
+            Document::BILL_TYPE     => trans_choice('general.bills', 1),
+            // ... 其他类型
+        };
+
+        // 核心：根据事件类不同选不同的多语言 key
+        $message_key = ($event instanceof DocumentMarkedSent)
+            ? 'documents.messages.marked_sent'   // "X 已标记为已发送"
+            : 'documents.messages.email_sent';   // "X 已通过邮件发送"
+
+        return trans($message_key, ['type' => $type_text]);
+    }
+}
+```
+
+#### 最终历史描述差异表（以销售发票为例）
+
+| 事件 | 多语言 key | 英文描述 | 中文（假设语言包为 zh-CN） | 写入 document_histories.description |
+|------|-----------|---------|--------------------------|-----------------------------------|
+| `DocumentSent` | `documents.messages.email_sent` | `Sales Invoice emailed` | `销售发票已通过邮件发送` | `销售发票已通过邮件发送` |
+| `DocumentMarkedSent` | `documents.messages.marked_sent` | `Sales Invoice marked as sent` | `销售发票已标记为已发送` | `销售发票已标记为已发送` |
+
+### 分流设计的数据流完整视图
+
+```
+  ┌───────────── 触发点汇总 ─────────────┐
+  │                                      │
+  │  SendDocument         (邮件真发了)    │────┐
+  │  SendDocumentAsCustomMail (自定义)    │────┼──► new DocumentSent
+  │  SendDocumentRecurringNotification    │────┘        │
+  │                                                     │
+  │  BulkActions/Sales/Invoices::sent()  (用户标记)  ───┼──► new DocumentMarkedSent
+  │                                                     │
+  └─────────────────────────────────────────────────────┘
+                              │
+                              ▼
+               Laravel Dispatcher (按 Event::$listen 路由)
+                              │
+         ┌────────────────────┴────────────────────┐
+         │ 两个事件都路由到同一个 Listener 类        │
+         ▼                                         ▼
+  MarkDocumentSent::handle(DocumentSent)    MarkDocumentSent::handle(DocumentMarkedSent)
+         │                                         │
+         ├─────────────────────────────────────────┤
+         │ 合流：相同的 status 更新逻辑             │
+         │                                         │
+         ▼                                         ▼
+  CreateDocumentHistory(..., getDescription())  CreateDocumentHistory(..., getDescription())
+         │                                         │
+         ▼                                         ▼
+  getDescription 判断 instanceof               getDescription 判断 instanceof
+    → 'documents.messages.email_sent'            → 'documents.messages.marked_sent'
+         │                                         │
+         ▼                                         ▼
+  INSERT document_histories                    INSERT document_histories
+  描述 = "销售发票已通过邮件发送"               描述 = "销售发票已标记为已发送"
+         │                                         │
+         └────────────────────┬────────────────────┘
+                              │
+                              ▼
+                   两张表结构完全一样，只有 description 不同
+                   审计追踪时可据此判断：是真发了还是手标了
+```
+
+---
+
+## 对 DocumentDeleted 章节分析的最终修正
+
+> **前置说明**：此前版本曾出现过"软删 Document 导致外键约束报错"、"逻辑荒谬"等主观或错误的表述。以下为基于代码的准确分析，所有结论可对照迁移文件、模型定义、源码逐行验证。
+
+### 分析步骤一：检查"外键约束"是否存在 — 结论：不存在
+
+迁移文件 [2019_11_16_000000_core_v2.php#L144-L159](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/database/migrations/2019_11_16_000000_core_v2.php#L144-L159) 中 `document_histories` 表的字段定义：
+
+```php
+Schema::create('document_histories', function (Blueprint $table) {
+    $table->unsignedInteger('document_id');    // ① 声明字段类型
+    // ...
+    $table->index('document_id');              // ② 建普通索引（加速查询）
+    // 没有：$table->foreign('document_id')->references('id')->on('documents')
+    // 没有：->onDelete('cascade') 之类外键约束语句
+});
+```
+
+全项目 grep 外键语句，外键仅出现在 `transaction_splits.split_id`、`role_user`、`permission_role` 等少数关联表。`document_histories.document_id` **从未声明过 `FOREIGN KEY` 约束**。
+
+因此"往 document_histories 插一条指向已软删 document_id 的行，会触发数据库外键约束异常"的说法在技术层面**完全不成立**。
+
+### 分析步骤二：检查 SoftDeletes 对 INSERT 新记录有无限制 — 结论：无影响
+
+`App\Abstracts\Model` 基类（[Abstracts/Model.php#L23](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Abstracts/Model.php#L23)）使用 `Illuminate\Database\Eloquent\SoftDeletes` Trait，Document 和 DocumentHistory 均继承了它。
+
+根据 Laravel 框架行为，SoftDeletes Trait 的作用域仅在：
+- **SELECT**：自动追加 `WHERE deleted_at IS NULL`
+- **UPDATE**：自动追加 `WHERE deleted_at IS NULL`（但 `$model->update()` 是按主键更新，走的是 set 方式，不走全局 scope）
+- **DELETE**：拦截后改为 `UPDATE ... SET deleted_at = NOW()`
+
+对 **INSERT 新记录**，SoftDeletes 没有任何限制、没有任何钩子。所以即使 `documents.id = 123` 这一行已被软删（`deleted_at` 非空），执行 `DocumentHistory::create(['document_id' => 123, ...])` 在**数据库层面和 Eloquent 层面都不会报错**。
+
+### 分析步骤三：如果在 DocumentDeleted 监听器里补写一条"删除历史"，实际会发生什么？
+
+重新对照 DeleteDocument 的执行顺序（[DeleteDocument.php#L14-L36](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Jobs/Document/DeleteDocument.php#L14-L36)）：
+
+```
+1. event(new DocumentDeleting)     → 事务前，无监听器
+2. DB::transaction 开始
+3.   Transaction::mute()
+4.   deleteRelationships(...)
+       遍历 items/item_taxes/histories/transactions/recurring/totals
+       → 每个 $item->delete()（逐条软删，走 Eloquent deleted 事件）
+       → histories 关联的 N 行 DocumentHistory 全部被软删（deleted_at 非空）
+5.   $this->model->delete()        → documents 该行被软删
+6.   Transaction::unmute()
+7. DB::transaction 提交             → 以上所有 UPDATE(deleted_at) 持久化
+8. event(new DocumentDeleted)      → 事务提交后，此时可补写历史
+```
+
+如果在第 8 步注册一个监听器，执行 `DocumentHistory::create(['document_id' => 123, 'description' => '单据已删除'])`：
+
+- 数据库层面：**正常 INSERT 一行**，没有任何错误
+- 该行的 `deleted_at` 为 `null`（因为是新 INSERT 的，没有 delete 操作）
+- 但 `document_id = 123` 指向的 documents 行已被软删
+
+### 分析步骤四：补写这条历史后，业务查询层面会遇到什么？
+
+分三种查询方向分析：
+
+| 查询场景 | 查询代码 | 实际结果 | 是否符合预期 |
+|---------|---------|---------|-------------|
+| 正常查看单据详情 | `Document::find(123)` | 返回 `null`（SoftDeletes 过滤掉了被软删的 document） | ✔ 被删的单据不应该看到，符合预期 |
+| Document 反向查历史 | `$document->histories` | 根本走不到（document 查不到） | — |
+| 管理后台查所有历史（独立列表） | `DocumentHistory::latest()->paginate()` | 能看到"单据已删除"这条新 history（`deleted_at` 是 null，没被过滤） | ✔ 能看到 |
+| 从第 3 条 history 点进 Document | `$history->document`（[DocumentHistory.php#L17-L20](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Models/Document/DocumentHistory.php#L17-L20)） | 返回 `null`（SoftDeletes 全局 Scope 过滤了被软删的 document；注意 `withoutGlobalScope('App\Scopes\Document')` 只移除自定义的 Document Scope，**不移除 SoftDeletes Scope**） | ❌ 能看到 history 但点进去 null，体验断层 |
+| 管理后台"回收站"（withTrashed） | `Document::withTrashed()->find(123)->histories` | 能拿到 document；但 `histories()` 关联只返回 `deleted_at IS NULL` 的行（SoftDeletes Scope） | ⚠ 结果：只能看到刚 INSERT 的那条"单据已删除"，之前的 N 条历史因为被软删了（步骤 4）全部看不到 |
+| 要完整看到单据+所有历史 | `Document::withTrashed()->find(123)->histories()->withTrashed()->get()` | 此时才能看到 旧 N 条（被软删的）+ 1 条新的 | ❌ 没有任何 UI 这么写 |
+
+### 最终结论：Akaunting 选择不补写"删除历史"的真正、代码层面的理由
+
+按重要性排序：
+
+| 序号 | 理由 | 代码依据 |
+|------|------|---------|
+| 1 | **数据完整性**：DeleteDocument 的 `deleteRelationships` 已把此前所有 DocumentHistory 软删，仅留一条"已删除"会给回收站视图造成信息断层（只剩操作记录，没有之前的上下文） | [Relationships.php#L41-L69](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Traits/Relationships.php#L41-L69) 中 `histories` 在删除清单里 |
+| 2 | **审计哲学一致性**：Akaunting 的 DocumentHistory 记录的是「单据生命周期中的状态跃迁」（创建/发送/付款/查看/取消/恢复），而 Delete 属于"生命周期终止"——终止之后追加一条终止声明，属于归档范畴，不属于"单据状态变更" | 对照所有 DocumentHistory 写入点，全部是状态变更事件的 Listener |
+| 3 | **UI/体验断层**：如上分析，补写的 history 能被"历史总览"看到，但点击进入 document 返回 null，体验不佳（除非同时修改所有 history 查询都加 `withTrashed()` on the relation） | [DocumentHistory.php#L17-L20](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Models/Document/DocumentHistory.php#L17-L20) 关系定义无 `withTrashed()` |
+| 4 | **Delete 与 Cancel 的语义分离**：用户想"中止单据 + 保留完整审计" → 应该走 Cancel（DocumentCancelled 事件，有监听器，正常写 history，保留所有关联数据）；Delete 是明确要"从列表中抹去"，抹干净比留一条更清晰 | 对照 [补充章节二] 中 DeleteDocument vs CancelDocument 对比表 |
+| 5 | **删除追溯靠基础设施**：如果真要查谁删的，用 `deleted_at` 时间戳 + Web 服务器 access_log + 运维层面 DB binlog，比业务层一条 history 更可靠且不可篡改 | 无需代码依据，行业通用实践 |
+
+这五条理由是 Akaunting 不注册 DocumentDeleted 监听器的完整说明。之前"外键约束会报错"、"逻辑荒谬"等表述均为不准确、情绪化的说法，已移除。
+
+---
+---
+
 ## 扩展文件索引（补充）
 
 | 分类 | 文件 | 作用 |
@@ -788,6 +1296,18 @@ ModuleHistory::create([
 | 事件定义 | [DocumentDeleted.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Events/Document/DocumentDeleted.php) | 无监听器的后置事件 |
 | 事件定义 | [DocumentDeleting.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Events/Document/DocumentDeleting.php) | 无监听器的前置事件 |
 | 事件定义 | [DocumentUpdating.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Events/Document/DocumentUpdating.php) | 更新前置事件 |
+| 付款通知监听器（竞态相关） | [SendDocumentPaymentNotification.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Listeners/Document/SendDocumentPaymentNotification.php) | 查 transactions 为空时静默 return |
+| 付款交易创建监听器 | [CreateDocumentTransaction.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Listeners/Document/CreateDocumentTransaction.php) | dispatch CreateBankingDocumentTransaction |
+| 银行单据交易 Job | [CreateBankingDocumentTransaction.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Jobs/Banking/CreateBankingDocumentTransaction.php) | 编排 Job，HasOwner/HasSource 委托给 CreateTransaction |
+| 银行交易基础 Job | [CreateTransaction.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Jobs/Banking/CreateTransaction.php) | ShouldCreate + HasOwner + HasSource 三件套 |
+| 银行交易税项 Job | [CreateTransactionTaxes.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Jobs/Banking/CreateTransactionTaxes.php) | 交易子实体，同样三件套 |
+| 邮件发送触发事件 | [DocumentSent.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Events/Document/DocumentSent.php) | 真发邮件后的事件 |
+| 人工标记触发事件 | [DocumentMarkedSent.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Events/Document/DocumentMarkedSent.php) | 用户手动标记的事件 |
+| 发送单据邮件 Job | [SendDocument.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Jobs/Document/SendDocument.php) | notify() 后触发 DocumentSent |
+| 批量标记入口 | [BulkActions/Sales/Invoices.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/BulkActions/Sales/Invoices.php) | sent() 方法触发 DocumentMarkedSent |
+| 合并监听器（两事件合流） | [MarkDocumentSent.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Listeners/Document/MarkDocumentSent.php) | handle 接受联合类型，按 instanceof 分流文案 |
+| 队列调度辅助函数 | [helpers.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Utilities/helpers.php#L136-L144) | should_queue() 根据 queue.default 判断 sync |
+| Jobs Trait | [Jobs.php](file:///d:/fz/0601-2/solo-dogfeeding/code/64-akaunting/app/Traits/Jobs.php) | dispatch() 动态选择 dispatchSync / dispatchQueue |
 
 ## 关键文件索引
 

@@ -650,6 +650,422 @@ public function getPaidAttribute()
 
 ---
 
+### 机制八：MatchBankingDocumentTransaction —— 改 document_id 绑定流水到单据并校验超额
+
+**代码位置**：
+- [MatchBankingDocumentTransaction.php](file:///d:/fz/0601-2/solo-dogfeeding/code/63-akaunting/app/Jobs/Banking/MatchBankingDocumentTransaction.php)
+
+#### 与 CreateBankingDocumentTransaction 的区别
+
+| 维度 | CreateBankingDocumentTransaction | MatchBankingDocumentTransaction |
+|------|----------------------------------|----------------------------------|
+| 场景 | 付款时新建一条流水并关联单据 | 已有独立流水，匹配并绑定到已存在的单据 |
+| Transaction | 新建 dispatch(CreateTransaction) | 更新已有 dispatch(UpdateTransaction) |
+| 核心动作 | 写入 `document_id`（新流水） | 改写已有 Transaction 的 `document_id` |
+
+#### 执行时序
+
+```
+handle()
+  ↓
+① checkAmount()          金额校验 + 状态计算
+  ├── round(amount, 交易币种精度)
+  ├── 币种不一致 → convertBetween 换算为单据币种
+  ├── $this->model->paid_amount = $this->model->paid   计算累计已付
+  ├── event(PaidAmountCalculated)                       触发事件（可由监听者修改 paid_amount）
+  ├── $total_amount = amount - paid_amount              剩余应付
+  ├── ↓↓ unset($this->model->reconciled)                清空属性缓存
+  ├── ↓↓ unset($this->model->paid_amount)               清空临时计算结果
+  └── bccomp(本次付款, 剩余应付)
+        → 1 → 抛 over_match 异常
+        → 0 → status = 'paid'
+        → -1 → status = 'partial'
+  ↓
+② DB::transaction {
+     dispatch(UpdateTransaction, [
+         document_id => $this->model->id,  // ← 核心：把已有流水绑定到单据
+         type        => 保持原 type
+     ])
+     $this->model->save()                  // 保存新状态 paid/partial
+     createHistory()                       // 写入单据历史
+   }
+  ↓
+return $this->transaction
+```
+
+#### 设计意图
+
+用于"银行流水导入后匹配单据"的场景：先从银行对账单导入一条独立的 Transaction（`document_id = null`），然后由用户或系统通过这个 Job 将它与某张 Invoice/Bill 绑定，绑定后该流水就被视为该单据的一笔付款，参与已付金额累计。
+
+---
+
+### 机制九：收入支出类型 —— 从 settings 动态读取 + 支持模块扩展
+
+**代码位置**：
+- [Transactions.php (Trait)](file:///d:/fz/0601-2/solo-dogfeeding/code/63-akaunting/app/Traits/Transactions.php#L84-L128)
+- [setting.php](file:///d:/fz/0601-2/solo-dogfeeding/code/63-akaunting/config/setting.php#L188-L195)
+
+#### 默认值（fallback）
+
+```php
+// config/setting.php:193-194
+'transaction.type.income'  => 'income,income-transfer',
+'transaction.type.expense' => 'expense,expense-transfer',
+```
+
+收入类型默认包含 `income` 和 `income-transfer`；支出类型默认包含 `expense` 和 `expense-transfer`。
+
+#### 动态读取
+
+```php
+// Traits/Transactions.php:94-103
+public function getTransactionTypes(string $index, string $return = 'array'): string|array
+{
+    $types = (string) setting('transaction.type.' . $index);  // 从 settings 表读取
+    return $return == 'array'
+        ? ($types === '' ? [] : explode(',', $types))
+        : $types;
+}
+```
+
+#### 判断收入/支出
+
+```php
+// Traits/Transactions.php:12-29
+public function isIncome(): bool
+{
+    $type = $this->type ?? $this->transaction->type ?? ...;
+    return in_array($type, $this->getIncomeTypes());  // ← 从 setting 动态拉取数组比对
+}
+
+public function isExpense(): bool
+{
+    return in_array($type, $this->getExpenseTypes());
+}
+```
+
+不是简单判断 `type == 'income'` 或 `str_contains($type, 'income')`，而是查 setting 里配置的类型列表。
+
+#### 模块扩展机制
+
+```php
+// Traits/Transactions.php:105-128
+public function addIncomeType(string $new_type): void
+{
+    $this->addTransactionType($new_type, 'income');
+}
+
+public function addExpenseType(string $new_type): void
+{
+    $this->addTransactionType($new_type, 'expense');
+}
+
+public function addTransactionType(string $new_type, string $index): void
+{
+    $types = explode(',', setting('transaction.type.' . $index));
+    if (in_array($new_type, $types)) return;  // 去重
+
+    $types[] = $new_type;
+    setting(['transaction.type.' . $index => implode(',', $types)])->save();
+    // ↑ 直接写 settings 表持久化
+}
+```
+
+第三方模块安装时可以调用 `addIncomeType('my-module-income-type')` 把自定义类型注册进去，之后系统中 `isIncome()` 判断就会识别该类型为收入。
+
+#### 配套：config/type.php 定义类型元信息
+
+虽然收入/支出列表在 setting 里动态维护，但每种交易类型的详细元信息（名称、对应单据类型、路由别名、图标等）仍然在 `config/type.transaction` 中定义。setting 存的是字符串列表，config 存的是类型说明。
+
+---
+
+### 机制十：Transaction 模型默认全局过滤 —— 排除经常性和拆分交易
+
+**代码位置**：
+- [Transaction.php (Scope)](file:///d:/fz/0601-2/solo-dogfeeding/code/63-akaunting/app/Scopes/Transaction.php)
+- [Transaction.php (Model)](file:///d:/fz/0601-2/solo-dogfeeding/code/63-akaunting/app/Models/Banking/Transaction.php#L97-L262)
+- [Scopes.php (Trait)](file:///d:/fz/0601-2/solo-dogfeeding/code/63-akaunting/app/Traits/Scopes.php)
+
+#### 注册全局 Scope
+
+```php
+// Models/Banking/Transaction.php:101-103
+protected static function booted()
+{
+    static::addGlobalScope(new Scope);   // ← App\Scopes\Transaction
+}
+```
+
+所有 `Transaction::query()` 默认都会带上这个 Scope。
+
+#### Scope 逻辑
+
+```php
+// Scopes/Transaction.php:21-26
+public function apply(Builder $builder, Model $model)
+{
+    $this->applyNotRecurringScope($builder, $model);  // 排除 *-recurring
+    $this->applyNotSplitScope($builder, $model);      // 排除 *-split
+}
+```
+
+底层调用两个本地 scope：
+
+```php
+// Models/Banking/Transaction.php:249-262
+public function scopeIsNotRecurring(Builder $query): Builder
+{
+    return $query->where($this->qualifyColumn('type'), 'not like', '%-recurring');
+}
+
+public function scopeIsNotSplit(Builder $query): Builder
+{
+    return $query->where($this->qualifyColumn('type'), 'not like', '%-split');
+}
+```
+
+#### 智能跳过机制
+
+```php
+// Traits/Scopes.php:11-31
+public function applyNotRecurringScope(Builder $builder, Model $model): void
+{
+    // 如果 where 条件里已经显式指定了 type 列 → 跳过 Scope，不追加过滤
+    if ($this->scopeColumnExists($builder, $model->getTable(), 'type')) {
+        return;
+    }
+    $builder->isNotRecurring();
+}
+```
+
+`scopeColumnExists()` 遍历当前 query 的所有 where 条件，只要发现任何一个涉及 `transactions.type` 列，就认为开发者已在业务层自行控制类型过滤，全局 Scope 不再追加 `not like '%-recurring'` 条件，避免冲突。
+
+#### 需要查看经常性/拆分交易时的做法
+
+```php
+// 方法一：移除整个全局 Scope
+Transaction::withoutGlobalScope(\App\Scopes\Transaction::class)->...
+
+// 方法二：Transfer 模型已自动移除
+// Models/Banking/Transfer.php:66-68
+return $this->belongsTo(Transaction::class, 'expense_transaction_id')
+                ->withoutGlobalScope('App\Scopes\Transaction')   // ← 自动加
+                ->withDefault([...]);
+```
+
+Transfer 关联交易时会自动 `withoutGlobalScope`，因为转账流水的 type 是 `income-transfer`/`expense-transfer`，不会被 recurring/split 过滤命中，但为了保险也移除了。
+
+#### Document 模型同样有全局 Scope
+
+`App\Scopes\Document` 只应用 `applyNotRecurringScope`（不应用 split scope），因此单据默认查询也排除 `*-recurring` 类型。
+
+---
+
+### 机制十一：PaidAmountCalculated 事件 —— 多处触发但无核心监听者
+
+**代码位置**：
+- [PaidAmountCalculated.php](file:///d:/fz/0601-2/solo-dogfeeding/code/63-akaunting/app/Events/Document/PaidAmountCalculated.php)
+
+#### 触发点（共四处）
+
+| 触发文件 | 位置 | 场景 |
+|----------|------|------|
+| `CreateBankingDocumentTransaction.php` | checkAmount() | 新建单据付款流水前 |
+| `UpdateBankingDocumentTransaction.php` | checkAmount() | 更新单据付款流水前 |
+| `MatchBankingDocumentTransaction.php` | checkAmount() | 匹配流水到单据时 |
+| `UpdateDocument.php` | handle() | 修改单据金额/币种时 |
+
+#### 触发模式（完全一致）
+
+```php
+$this->model->paid_amount = $this->model->paid;   // ① 先把已付金额算出，挂到模型属性上
+event(new PaidAmountCalculated($this->model));    // ② 触发事件
+// ③ 后续用 $this->model->paid_amount 做状态判断
+$total_amount = round($this->model->amount - $this->model->paid_amount, $precision);
+```
+
+#### 无核心监听者
+
+在 `App\Providers\Event` 事件服务提供者中，`PaidAmountCalculated` **没有注册任何监听者**。核心代码中没有类监听这个事件。
+
+#### 扩展钩子设计
+
+这个事件是纯粹的**扩展点**，留给第三方模块/插件使用。监听者拿到 `$event->model` 后：
+
+1. 可以**读取** `$model->paid_amount` 查看当前已付金额
+2. 可以**修改** `$model->paid_amount = xxx`，后续校验逻辑会使用修改后的值
+3. 典型用途：实现"折扣""预存抵扣""信用额度"等需要在付款时冲减已付金额的功能
+
+#### 配合 unset 机制使用（见机制十二）
+
+事件修改完 `paid_amount` 后，紧接着就会 `unset($this->model->paid_amount)`，不会把监听者改的值持久化到数据库，只用于本次校验。
+
+---
+
+### 机制十二：unset 已付和对账属性 —— 清理缓存避免脏数据驱动重算
+
+**代码位置**：
+- [MatchBankingDocumentTransaction.php](file:///d:/fz/0601-2/solo-dogfeeding/code/63-akaunting/app/Jobs/Banking/MatchBankingDocumentTransaction.php#L64-L65)
+- [UpdateDocument.php](file:///d:/fz/0601-2/solo-dogfeeding/code/63-akaunting/app/Jobs/Document/UpdateDocument.php#L69-L70)
+- [CreateBankingDocumentTransaction.php](file:///d:/fz/0601-2/solo-dogfeeding/code/63-akaunting/app/Jobs/Banking/CreateBankingDocumentTransaction.php)
+- [UpdateBankingDocumentTransaction.php](file:///d:/fz/0601-2/solo-dogfeeding/code/63-akaunting/app/Jobs/Banking/UpdateBankingDocumentTransaction.php)
+
+#### 典型代码片段
+
+```php
+// MatchBankingDocumentTransaction.php:59-66
+$this->model->paid_amount = $this->model->paid;       // ① 手动赋值，挂在模型 attributes 数组上
+event(new PaidAmountCalculated($this->model));         // ② 监听者可能进一步修改 paid_amount
+
+$total_amount = round($this->model->amount - $this->model->paid_amount, $precision);  // ③ 用临时值计算
+
+unset($this->model->reconciled);      // ← ④ 清理临时属性
+unset($this->model->paid_amount);     // ← ④ 清理临时属性
+```
+
+#### Eloquent 属性缓存原理
+
+Laravel Eloquent Model 的 attributes 数组是读写缓存：
+
+- `$model->paid_amount` 先查 `$this->attributes['paid_amount']`，有就直接返回（不走 accessor）
+- 如果 attributes 中不存在，再走 `getPaidAmountAttribute()` accessor 动态计算
+
+#### 为什么要 unset
+
+| 属性 | 原因 |
+|------|------|
+| `paid_amount` | ① checkAmount() 中临时赋值用于计算，存的是"已换算成单据币种的金额"，不是数据库字段。如果不 unset，后续 `$model->save()` 会把它当字段写入导致 SQL 报错，或后续读取 `$model->paid` 时不走 accessor 而是返回这个过期临时值 |
+| `reconciled` | 不是 Document 表字段，是 `getReconciledAttribute()` 动态计算（看关联交易是否都已对账）。若有人在流程中给 Document 临时挂了 `reconciled` 属性，会导致后续 accessor 被短路，返回错误值 |
+
+一句话：**计算过程中临时挂载到模型上的值，用完必须 unset，避免污染 attributes 缓存影响后续 accessor 或 save 操作**。
+
+#### 在 UpdateDocument 中的另一个作用
+
+```php
+// UpdateDocument.php:69-72
+unset($this->model->reconciled);
+unset($this->model->paid_amount);
+$this->model->update($this->request->all());
+```
+
+如果不先 unset，`$this->model->paid_amount` 会出现在 Model 的 `$this->attributes` 里，`update()` 方法会把它当数据库字段一起 `UPDATE documents SET paid_amount = xxx` 执行，直接 SQL 报错。
+
+---
+
+### 机制十三：Transfer 展示字段 —— 从两条流水反向拼装
+
+**代码位置**：
+- [Transfer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/63-akaunting/app/Models/Banking/Transfer.php)
+
+#### 表结构极简
+
+`transfers` 表只有 5 个字段：
+
+| 字段 | 说明 |
+|------|------|
+| `id` | 主键 |
+| `company_id` | 公司ID |
+| `expense_transaction_id` | FK → 支出流水ID |
+| `income_transaction_id` | FK → 收入流水ID |
+| `created_from` / `created_by` / `created_at` / `updated_at` | 审计字段 |
+
+**金额、日期、描述、支付方式、账户、币种、汇率等所有业务字段全部不存在 transfers 表中**。
+
+#### 反向拼装原理
+
+通过 Eloquent accessor（`getXxxAttribute`）从两条关联 Transaction 动态读取：
+
+```
+transfers 表
+  ├── expense_transaction_id → Transaction(type=expense-transfer)
+  │     ├── account_id      → from_account_id
+  │     ├── currency_code   → from_currency_code
+  │     ├── currency_rate   → from_account_rate
+  │     ├── paid_at         → transferred_at
+  │     ├── description     → description
+  │     ├── amount          → amount
+  │     ├── payment_method  → payment_method
+  │     └── reference       → reference
+  │
+  └── income_transaction_id  → Transaction(type=income-transfer)
+        ├── account_id       → to_account_id
+        ├── currency_code    → to_currency_code
+        └── currency_rate    → to_account_rate
+```
+
+#### accessor 实现模式
+
+```php
+// Transfer.php:139-142
+public function getFromAccountIdAttribute($value = null)
+{
+    return $value ?: $this->expense_transaction->account_id;
+    //         ↑ DB 字段（可为空）  ↑ 关联流水上的字段（兜底）
+}
+
+// Transfer.php:199-202
+public function getTransferredAtAttribute($value = null)
+{
+    return $value ?: $this->expense_transaction->paid_at;
+}
+
+// Transfer.php:219-222
+public function getAmountAttribute($value = null)
+{
+    return $value ?: $this->expense_transaction->amount;
+}
+```
+
+所有展示属性都走同一模式：**优先用 transfers 表自己的字段（如果未来有），否则从 expense_transaction（转出流水）取**。转出方流水被视为"主流水"，金额、日期、描述、支付方式、参考号都以转出方为准。转入方流水只提供 `to_account_id`、`to_currency_code`、`to_account_rate` 三个目标账户相关字段。
+
+#### $appends 声明
+
+```php
+// Transfer.php:19-32
+protected $appends = [
+    'attachment',
+    'from_account_id', 'from_currency_code', 'from_account_rate',
+    'to_account_id', 'to_currency_code', 'to_account_rate',
+    'transferred_at', 'description', 'amount', 'payment_method', 'reference',
+];
+```
+
+这些 accessor 都被加入 `$appends`，序列化（toArray / JSON）时自动输出，前端可直接用。
+
+#### 关联上移除 Transaction 全局 Scope
+
+```php
+// Transfer.php:64-68
+public function expense_transaction()
+{
+    return $this->belongsTo(Transaction::class, 'expense_transaction_id')
+                    ->withoutGlobalScope('App\Scopes\Transaction')  // ← 必须移除
+                    ->withDefault(['name' => trans('general.na')]);
+}
+```
+
+因为转账流水的 type 是 `income-transfer` / `expense-transfer`，不会被 `-recurring` 或 `-split` 过滤命中，理论上不需要移除 Scope。但为了防止未来 Scope 扩展（比如加 `-transfer` 过滤），这里提前防御性地移除了。
+
+#### 排序字段也来自两条流水
+
+```php
+// Transfer.php:46-55
+public $sortable = [
+    'expense_transaction.paid_at',      // 转账日期（转出方）
+    'expense_transaction.reference',
+    'expense_transaction.name',
+    'income_transaction.name',
+    'expense_transaction.rate',
+    'income_transaction.rate',
+    'expense_transaction.amount',       // 转账金额（转出方币种）
+    'income_transaction.amount',        // 入账金额（转入方币种，跨币种时不同）
+];
+```
+
+列表排序可以按转出方或转入方的任意字段进行，体现了"一条 Transfer = 两条 Transaction 组合视图"的设计理念。
+
+---
+
 ## 总结
 
 1. **付款 = 交易流水**：每笔付款记录就是一条 transaction，直接体现在银行账户流水中
@@ -666,3 +1082,9 @@ public function getPaidAttribute()
 10. **交易类型推断**：通过 `type` 字符串含 `expense` 和 `recurring_frequency` 两个维度推断四类交易
 11. **转账守卫机制**：`UpdateTransaction`/`DeleteTransaction` 禁止操作 `-transfer` 类型交易，必须走专门的 Transfer 作业
 12. **已付属性优化**：双层短路返回 + lazy eager load 防 N+1，兼顾正确性和性能
+13. **流水绑定单据**：`MatchBankingDocumentTransaction` 改写已有 Transaction 的 `document_id`，将独立流水与单据关联并做超额校验
+14. **交易类型动态配置**：收入/支出类型列表存于 settings 表，支持模块通过 `addIncomeType()`/`addExpenseType()` 运行时扩展
+15. **全局查询过滤**：`Transaction` 模型默认排除 `*-recurring` 和 `*-split` 类型，但 where 中已指定 type 时自动跳过
+16. **PaidAmountCalculated 扩展钩子**：四处触发无核心监听者，监听者可修改 `$model->paid_amount` 影响后续校验
+17. **unset 清理机制**：计算过程中临时挂到模型上的 `paid_amount`、`reconciled` 用完必须 unset，避免污染 attributes 缓存
+18. **Transfer 反向拼装**：transfers 表仅存两外键，所有业务字段通过 accessor 从两条 Transaction 动态读取，转出方为主流水

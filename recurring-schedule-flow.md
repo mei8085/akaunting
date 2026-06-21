@@ -150,12 +150,25 @@ $this->model->createRecurring($this->request->all());
 ```
 用户提交创建请求
     ↓
-TransactionCreating Event
+TransactionCreating Event  ← 前置事件
     ↓
-判定 type：若设置了 recurring_frequency 则设置为 *-recurring 类型
+【Gate】type 配置校验 + expense/income 分流（★补充）
+  if (type 不在 config('type.transaction') 键中) {
+    $isExpense = str_contains(type, 'expense')
+    $isRecurring = recurring_frequency 存在且 != no
+    type = $isExpense
+      ? ($isRecurring ? expense-recurring : expense)
+      : ($isRecurring ? income-recurring  : income)
+    request->merge(['type' => type])
+  }
     ↓
 DB::transaction {
-    Transaction::create(...)      ← 落库 transactions 表
+    Transaction::create(...)      ← 主记录落库 transactions 表
+    ↓
+    【子步骤】attachment 媒体上传（★补充）
+      request 有 attachment 文件 → 遍历上传：
+        getMedia($file, 'transactions')
+        $model->attachMedia($media, 'attachment')
     ↓
     CreateTransactionTaxes        ← 创建税项
     ↓
@@ -163,7 +176,27 @@ DB::transaction {
 }
     ↓
 TransactionCreated Event 触发
+    ↓
+IncreaseNextTransactionNumber  ← 自增单据编号
 ```
+
+**type 配置 gate + 分流逻辑详解（★补充）：**
+
+| 步骤 | 代码位置 | 逻辑 |
+|------|---------|------|
+| **Gate 判断** | [L20](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Jobs/Banking/CreateTransaction.php#L20) | `array_key_exists($type, config('type.transaction'))` —— 如果 type 在配置表中已注册，**直接使用，不做任何改写** |
+| **expense 判断** | [L21](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Jobs/Banking/CreateTransaction.php#L21) | `str_contains($type, 'expense')` —— 通过字符串包含判断是支出类还是收入类（不是严格等于，而是模糊匹配，支持自定义后缀 type） |
+| **recurring 判断** | [L22](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Jobs/Banking/CreateTransaction.php#L22) | `!empty(recurring_frequency) && recurring_frequency !== 'no'` —— 只有明确设置了频率且不是"不重复"时，才按 recurring 类型处理 |
+| **四分流结果** | [L24-L26](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Jobs/Banking/CreateTransaction.php#L24-L26) | ① expense+recurring → `expense-recurring` ② expense+普通 → `expense` ③ income+recurring → `income-recurring` ④ income+普通 → `income` |
+
+> 设计含义：`config('type.transaction')` 是已注册的合法类型白名单。如果 type 已在白名单里（比如模块扩展注册的自定义类型），就直接用，不强制改写；只有当 type 是"野生"的（不在配置中），才 fallback 到默认的 expense/income + recurring 四分法。
+
+**attachment 上传（★补充）：**
+
+与 Document 路径相同，Transaction 创建时也支持 attachment 附件上传，也是在**事务内**、主记录 create 之后执行：
+- 调用 `$this->getMedia($attachment, 'transactions')` 上传到 `YYYY/MM/DD/{company_id}/transactions/` 目录
+- `$model->attachMedia($media, 'attachment')` 建立媒体-交易关联
+- 同样存在"事务回滚但文件已落盘"的副作用问题
 
 ### 3.3 createRecurring() 核心逻辑
 
@@ -588,24 +621,40 @@ try { 调用具体方法 }
     ↓
 2. $model = $template->duplicate()
    → 调用 Bkwld\Cloner\Cloneable::duplicate()
-   → 复制主表记录 + cloneable_relations 指定的关联记录
-   → 新记录 id 已生成，但尚未 save()（等后续字段赋值后再 save）
+   → ★ 克隆并立即落库 (主表 INSERT + 关联表 INSERT)
+   → 新记录已有 id 和 created_at 等都已生成
+   → 子关联 items/totals 也已 INSERT 了，且 type 仍是模板类型
     ↓
 3. 计算 due_at 与 issued_at 的差值天数 $diff_days
     ↓
-4. 赋值关键字段：
-   $model->type         = Str::replace('-recurring', '', $template->type)  // invoice-recurring → invoice
-   $model->parent_id    = $template->id         // 建立父子关系
-   $model->issued_at    = $schedule_date        // 计划日期作为开单日期
-   $model->due_at       = $schedule_date + $diff_days  // 按模板比例顺延到期日
-   $model->created_from = 'core::recurring'      // 标记来源
+4. 赋值关键字段（在已落库的记录上修改）：
+   $model->type         = Str::replace('-recurring', '', $template->type)
+   $model->parent_id    = $template->id
+   $model->issued_at    = $schedule_date
+   $model->due_at       = $schedule_date + $diff_days
+   $model->created_from = 'core::recurring'
     ↓
-5. $model->save()         ← ★ 主记录落库 (documents 表)
+5. $model->save()         ← ★ UPDATE 保存（不是 INSERT，记录已存在，更新修改后的字段）
     ↓
-6. updateRelationTypes() → 将关联的 items、totals 记录的 type 字段也改为新类型 (invoice)
+6. updateRelationTypes() → 将 items、totals 的 type 也改为新类型
     ↓
 返回 $model
 ```
+
+**duplicate() = 克隆并落库（★理解修正）：**
+
+`Bkwld\Cloner\Cloneable` 的 `duplicate()` 方法是**克隆即落库**，两步合一：
+
+| 步骤 | 说明 |
+|------|------|
+| ① 复制属性 | 复制主模型所有字段值（排除主键等）到新实例 |
+| ② 主记录 INSERT | `$clone->save()` → 主表执行 INSERT，新记录已有 id / created_at |
+| ③ 关联记录 INSERT | 递归遍历 `$cloneable_relations`，每个关联也执行 INSERT |
+| ④ 返回 | 返回已持久化的新模型实例 |
+
+所以后面的 `$model->save()` 是**UPDATE 操作**，不是 INSERT。因为记录已经存在，改字段后再 save() 等于 update。
+
+> 为什么不先改字段再一次性 save？因为 Cloneable 是通用克隆库，设计语义就是"克隆即落库"。调用方拿到已落库的对象后再做业务字段调整、再 save() 更新，是该库的惯用模式。
 
 ### 5.3 生成 Transaction 子单据：getTransactionModel()
 
@@ -616,17 +665,17 @@ try { 调用具体方法 }
    (覆盖默认的 ['recurring', 'taxes']，不克隆 recurring)
     ↓
 2. $model = $template->duplicate()
-   → 复制主表记录 + taxes 关联
+   → 克隆并立即落库 (主表 + taxes 关联都已 INSERT)
     ↓
-3. 赋值关键字段：
+3. 赋值关键字段（在已落库记录上修改）：
    $model->type         = 去掉 -recurring 后缀
    $model->parent_id    = $template->id
-   $model->paid_at      = $schedule_date        // 计划日期作为付款日期
+   $model->paid_at      = $schedule_date
    $model->created_from = 'core::recurring'
     ↓
-4. $model->save()         ← ★ 主记录落库 (transactions 表)
+4. $model->save()         ← ★ UPDATE 保存（记录已存在，更新修改后的字段）
     ↓
-5. updateRelationTypes() → 更新 taxes 关联记录的 type 字段
+5. updateRelationTypes() → 更新 taxes 关联的 type 字段
     ↓
 返回 $model
 ```
@@ -776,18 +825,57 @@ public const COMPLETE_STATUS = 'completed';
 
 ## 七、事件与通知链路
 
-### 7.1 Event 注册
+### 7.1 Event 注册总表（★补充完整）
 
 **文件**：[Event.php](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Providers/Event.php)
 
-| 事件 | 监听者 |
-|------|--------|
-| DocumentCreated | CreateDocumentCreatedHistory, IncreaseNextDocumentNumber, SettingFieldCreated |
-| **DocumentRecurring** | **SendDocumentRecurringNotification** |
-| TransactionCreated | IncreaseNextTransactionNumber |
-| TransactionRecurring | (无默认监听) |
+#### 7.1.1 与 recurring 相关的核心事件
 
-### 7.2 DocumentRecurring 通知发送：三层 Gate + 配置驱动（★大幅修正补充）
+| 事件 | 监听者 | 说明 |
+|------|--------|------|
+| **DocumentCreated** | CreateDocumentCreatedHistory, IncreaseNextDocumentNumber, SettingFieldCreated | 创建后三连：写历史+自增编号+设置字段初始化 |
+| **DocumentRecurring** | SendDocumentRecurringNotification | recurring 生成后：发通知 + 触发 sent/received 事件 |
+| **TransactionCreated** | IncreaseNextTransactionNumber | 交易创建后自增编号 |
+| **TransactionRecurring** | (无默认监听) | —— |
+
+#### 7.1.2 单据状态流转事件（sent / received 链）（★补充完整）
+
+| 事件 | 监听者 | 状态变更 | 触发场景 |
+|------|--------|---------|---------|
+| **DocumentSent** | MarkDocumentSent | `status = sent` | 发票被标记为已发送 |
+| **DocumentMarkedSent** | MarkDocumentSent | `status = sent` | 手动标记为已发送（与 Sent 是两个独立事件，但 listener 相同） |
+| **DocumentReceived** | MarkDocumentReceived | `status = received` | 账单被标记为已收到 |
+| **DocumentCancelled** | MarkDocumentCancelled | `status = cancelled` | 单据被取消 |
+| **DocumentViewed** | MarkDocumentViewed, SendDocumentViewNotification | `status = viewed` + 通知 | 客户在门户查看了单据 |
+| **PaymentReceived** | CreateDocumentTransaction, SendDocumentPaymentNotification | 生成付款交易 + 通知 | 收到付款 |
+
+> **关键补充**：DocumentSent 和 DocumentMarkedSent 是**两个独立事件类**，但挂了**同一个监听器 MarkDocumentSent**。语义上：DocumentSent 是"系统发送出去了"（如 recurring 自动发邮件、系统触发），DocumentMarkedSent 是"用户手动标了已发送"。两者最终效果都是 status 变为 sent。
+
+#### 7.1.3 recurring 场景下的事件链路串联
+
+```
+recur() 事务内触发两个事件：
+    │
+    ├─ event(DocumentCreated)
+    │    ├─ CreateDocumentCreatedHistory   ← 写操作历史
+    │    ├─ IncreaseNextDocumentNumber     ← 自增下一张单据编号
+    │    └─ SettingFieldCreated            ← 初始化设置字段
+    │
+    └─ event(DocumentRecurring)
+         └─ SendDocumentRecurringNotification
+              ├─ Gate1(配置存在?)
+              ├─ Gate2(auto_send开?)
+              ├─ 客户可达 → 通知客户（带PDF）
+              ├─ ★ event(DocumentSent / DocumentReceived)  ← 配置驱动
+              │    └─ MarkDocumentSent / MarkDocumentReceived
+              │         └─ status = sent / received
+              ├─ Gate3b(notify_user?)
+              └─ 用户有权限 → 通知管理员
+```
+
+> **理解修正**：DocumentRecurring 本身不直接改变单据状态；它通过 SendDocumentRecurringNotification 监听器**间接触发** DocumentSent 或 DocumentReceived 事件，由 MarkDocumentSent / MarkDocumentReceived 监听器负责把 status 改为 sent / received。这是一个"事件→监听器→新事件→新监听器"的二级事件链。
+
+### 7.2 DocumentRecurring 通知发送：三层 Gate + 配置驱动
 
 **监听器**：[SendDocumentRecurringNotification.php](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Listeners/Document/SendDocumentRecurringNotification.php#L19-L57)
 
@@ -980,7 +1068,7 @@ Company::forgetCurrent()
 
 9. **原子性 + 失败隔离**：每个 schedule 日期独立事务，getModel() 内 try/catch 捕获异常返回 false，单个日期失败不影响后续日期及其他 recurring。
 
-10. **克隆 + 修正两步走**：使用 Cloneable 快速复制主记录及关联(去掉recurring以免模板关联链被复制)，再通过 updateRelationTypes 批量更新子关联的 type 字段与主记录对齐。
+10. **克隆即落库 + 二次 update 修正**（★理解修正）：`Cloneable::duplicate()` 是克隆即落库（主表 INSERT + 关联表 INSERT 一次完成），返回已持久化的新实例。后续 `$model->save()` 是 UPDATE 操作，用于修正 type / parent_id / 日期等业务字段；再通过 `updateRelationTypes()` 批量更新子关联 type 与主记录对齐。
 
 11. **getModel 类型违例 + 静默异常出口**：源码声明返回 `Document|Transaction`（非三联合），但 catch `\Throwable` 里实际 `return false`，是一个类型违例（strict_types 下 TypeError）。调用方用 `!$model` 松散比较短路跳过，所有异常都被吞掉，只能靠日志发现。
 
@@ -995,3 +1083,9 @@ Company::forgetCurrent()
 16. **4 条孤儿清理路径**：handle() 主循环内置 4 个 GC 分支——公司不存在、公司禁用超3个月、无活跃用户超3个月、关联模板已被删——分别在 makeCurrent 前后分布执行，防止脏数据长期占用调度。
 
 17. **updateRecurring 三分支架构**：frequency=no 走删除分支（与 createRecurring 的 no return 不同）；frequency 有效时按 recurring 关联是否存在分别走 update（不改 created_from/by）或 create（补创建，强制 ACTIVE_STATUS）分支。End 按钮改 ended 状态正是走 update 分支的 status 写入路径。
+
+18. **Transaction type 配置白名单 gate + 四分流**：`config('type.transaction')` 是合法类型白名单；type 在白名单内直接用，不在则按 `str_contains(type, 'expense')` + 是否 recurring 组合出 expense/income + recurring/普通四种组合。
+
+19. **二级事件链 + 监听器复用**：DocumentCreated 挂三个 listener（历史+编号+设置）；DocumentRecurring 自身不改状态，通过 SendDocumentRecurringNotification 间接触发 DocumentSent/DocumentReceived（配置驱动），再由 MarkDocumentSent/MarkDocumentReceived 改状态。DocumentSent 与 DocumentMarkedSent 是两个事件但共用同一个 MarkDocumentSent 监听器。
+
+20. **Transaction 也有 attachment 上传**：CreateTransaction 与 CreateDocument 对称，事务内主记录创建后也支持 attachment 附件上传，同样存在"事务回滚不删物理文件"的副作用。

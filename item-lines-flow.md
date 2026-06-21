@@ -1,4 +1,4 @@
-# Item 数量与单据行金额联动计算链路
+﻿# Item 数量与单据行金额联动计算链路
 
 ## 整体架构概览
 
@@ -188,7 +188,7 @@ if (! empty($this->request['global_discount'])) {
 
 #### 4.2.1 复合税（Compound）Base 的累加构成详解
 
-复合税的计算基数（base）是**动态累加**的，但有一个**关键的剥离机制**：价内税会被从 base 中剥离，不会被复合税叠加计算。
+复合税的计算基数（base）是**动态累加**的。`$item_amount` 的初始值就是经过折扣的金额，该金额**本身就包含价内税部分**（价内税是嵌入在价格中的），inclusive 块不会修改 `$item_amount`。
 
 **后端计算链路（CreateDocumentItem.php:58-155）**
 
@@ -196,6 +196,7 @@ if (! empty($this->request['global_discount'])) {
 // Line 60: 初始化三个关键变量
 $actual_price_item = $item_amount = $item_discounted_amount;
 // 此时：三者都等于 折扣后的金额 (price × quantity - 行折扣 - 全局折扣)
+// ⚠️ 这个金额本身就包含了价内税，因为价内税是嵌入在价格中的
 
 // ── 第1步：inclusive 价内税 ──────────────────────────────────
 // Line 82-96
@@ -206,16 +207,13 @@ foreach ($inclusives as $inclusive) {
 $actual_price_item = $item_discounted_amount - $item_tax_total;
 // 此时：$actual_price_item = 不含价内税的净价
 // ⚠️ 重要：$item_amount 此时未变，还是 $item_discounted_amount！
-//         价内税只影响 $actual_price_item，不影响 $item_amount
-//         这就是为什么复合税 base 中不包含价内税
+//         inclusive 块只修改了 $actual_price_item，没有修改 $item_amount
+//         所以 $item_amount 仍然保留着价内税部分
 
 // ── 第2步：fixed 固定税 ────────────────────────────────────
 // Line 98-111
 foreach ($fixeds as $tax) {
-    // ⚠️ 数量参数说明：
-    // 这里的 $this->request['quantity'] 已经经过 FormRequest 中的
-    // calculation_to_quantity() 转换（Document.php L97-118）
-    // 例如输入 "2x3" 已经变成 6，所以这里 (double) 只是类型转换
+    // ⚠️ 截位风险说明见 4.2.1.3 节
     $tax_amount = $tax->rate * (double) $this->request['quantity'];
     $item_amount += $tax_amount;  // ← 累加到 $item_amount
 }
@@ -237,49 +235,48 @@ foreach ($withholdings as $tax) {
 // ── 第5步：compound 复合税 ─────────────────────────────────
 // Line 143-155
 foreach ($compounds as $compound) {
-    // 重点：base = $item_amount = 折扣后金额 + fixed + normal + withholding
-    //       但 不包含 价内税！因为 $item_amount 在价内税阶段没有被修改
+    // 重点：base = $item_amount = 折扣后金额(含价内税) + fixed + normal + withholding
     $tax_amount = ($item_amount / 100) * $compound->rate;
     $item_tax_total += $tax_amount;
 }
 ```
 
-**⚠️ 复合税 Base 漏掉价内税的原理：**
+**复合税 Base 包含价内税的原理：**
 
-关键在于 Line 60 的初始化和 Line 95 的赋值：
+关键在于 Line 60 的初始化和 inclusive 块的行为：
 ```php
 Line 60:  $actual_price_item = $item_amount = $item_discounted_amount;
-          // 三者指向同一个值，但后续修改互不影响
+          // 三个变量初始化为同一个值
 
 Line 82-96: 价内税计算时
-          - 只修改了 $item_tax_total（累加）
-          - 只修改了 $actual_price_item（剥离价内税）
-          - ❌ 没有修改 $item_amount！！
+          - 修改了 $item_tax_total（累加）
+          - 修改了 $actual_price_item（剥离价内税 → 用于 normal/withholding 基数）
+          - ❌ 没有修改 $item_amount
+          - 所以 $item_amount 保留了 $item_discounted_amount 的完整值（含价内税）
 
 Line 95:  $actual_price_item = $item_discounted_amount - $item_tax_total;
           // 价内税只从 $actual_price_item 中剥离
 ```
 
-所以复合税 base 的真实构成是：
+复合税 base 的真实构成：
 
 ```
 compound_base = $item_amount
-              = $item_discounted_amount  (初始值)
+              = $item_discounted_amount  (初始值，含价内税)
               + Σ fixed_tax_amount       (第2步累加)
               + Σ normal_tax_amount      (第3步累加)
               + Σ withholding_tax_amount (第4步累加，负数)
 ```
 
-**修正后的复合税 Base 公式：**
+**复合税 Base 公式：**
 ```
-compound_base = 折扣后金额 + fixed税总额 + normal税总额 + withholding税总额
-              = 不含价内税，且是扣除全局折扣后的金额
+compound_base = 折扣后金额(含价内税) + fixed税总额 + normal税总额 + withholding税总额
 ```
 
 > **关键区别**：
 > - normal/withholding 税基于 `$actual_price_item`（折扣后 - 价内税 - 全局折扣）
-> - compound 税基于 `$item_amount`（折扣后 - 全局折扣 + fixed/normal/withholding）
-> - **两者都不包含价内税，但基数完全不同**
+> - compound 税基于 `$item_amount`（折扣后含价内税 - 全局折扣 + fixed/normal/withholding）
+> - **compound 的 base 包含价内税，因为 `$item_amount` 的初始值 `$item_discounted_amount` 本身就是含价内税的金额，而 inclusive 块不会修改 `$item_amount`**
 
 **前端对应逻辑（documents.js:513-524）**
 ```javascript
@@ -554,7 +551,7 @@ Line 60 初始化（扣除全局折扣后的值）：
 第5步 - 复合税 (compound 3%)：
   ⚠️  base = $item_amount = 203.09
   ( = 全局折扣后金额 180 + fixed 10 + normal 21.27 + withholding -8.18 )
-  ( 不含价内税！因为 $item_amount 在价内税阶段没有被修改 )
+  ( 含价内税！因为 $item_amount 初始值就是含价内税的折扣后金额，而 inclusive 块不会修改 $item_amount )
   税额 = 203.09 × 3% = 6.09
   $item_tax_total = 39.45 + 6.09 = 45.54
 
@@ -959,10 +956,38 @@ UpdateDocument / CreateDocument 继续执行：
 | 后端表达式计算 | [helpers.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Utilities/helpers.php) | L455 |
 | 表单验证预处理 | [Document.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Http/Requests/Document/Document.php) | L97 |
 | 单行金额计算 | [CreateDocumentItem.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Jobs/Document/CreateDocumentItem.php) | L34 |
-| 税种计算 | [CreateDocumentItem.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Jobs/Document/CreateDocumentItem.php) | L69-L156 |
+| 税种计算主流程 | [CreateDocumentItem.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Jobs/Document/CreateDocumentItem.php) | L69-L156 |
+| **三变量初始化 (价内税剥离关键)** | [CreateDocumentItem.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Jobs/Document/CreateDocumentItem.php) | L60 |
+| **价内税计算 & $actual_price_item 剥离** | [CreateDocumentItem.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Jobs/Document/CreateDocumentItem.php) | L82-L96 |
+| **fixed 税 (double) 截位风险 (L34/L171 对比)** | [CreateDocumentItem.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Jobs/Document/CreateDocumentItem.php) | L100, L34, L171 |
+| **全局折扣分摊二分入口 (fixed vs percentage)** | [CreateDocumentItemsAndTotals.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Jobs/Document/CreateDocumentItemsAndTotals.php) | L170-L186 |
+| **复合税 base = $item_amount (含价内税，inclusive 块不修改它)** | [CreateDocumentItem.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Jobs/Document/CreateDocumentItem.php) | L143-L155 |
+| **DocumentItemTax abs() 绝对值存储** | [CreateDocumentItem.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Jobs/Document/CreateDocumentItem.php) | L193 |
+| **前端复合税基于 grand_total 计算** | [documents.js](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/resources/assets/js/views/common/documents.js) | L513-L524 |
+| **前端 fixed 税 calculationToQuantity 即时计算** | [documents.js](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/resources/assets/js/views/common/documents.js) | L477 |
+| **前端 withholding 负号处理** | [documents.js](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/resources/assets/js/views/common/documents.js) | L505 |
+| 多税聚合（前端） | [documents.js](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/resources/assets/js/views/common/documents.js) | L569-L587 |
+| 多税聚合（后端内存带符号累加） | [CreateDocumentItemsAndTotals.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Jobs/Document/CreateDocumentItemsAndTotals.php) | L240-L250 |
+| **DocumentTotal abs() 存储 + 带符号累加** | [CreateDocumentItemsAndTotals.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Jobs/Document/CreateDocumentItemsAndTotals.php) | L103, L109 |
+| 删除行项目（前端临时） | [documents.js](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/resources/assets/js/views/common/documents.js) | L690-L695 |
+| 删除行内税 | [documents.js](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/resources/assets/js/views/common/documents.js) | L771-L782 |
+| 删除行折扣 | [documents.js](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/resources/assets/js/views/common/documents.js) | L740-L745 |
+| 新增行项目 | [documents.js](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/resources/assets/js/views/common/documents.js) | L594-L651 |
+| 发票 Controller | [Invoices.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Http/Controllers/Sales/Invoices.php) | - |
+| 发票创建 store | [Invoices.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Http/Controllers/Sales/Invoices.php) | L100-L125 |
+| 发票编辑 update | [Invoices.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Http/Controllers/Sales/Invoices.php) | L189-L214 |
+| 创建单据 Job | [CreateDocument.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Jobs/Document/CreateDocument.php) | L20-L57 |
+| 更新单据 Job（全删全插） | [UpdateDocument.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Jobs/Document/UpdateDocument.php) | L19-L87 |
+| 后端编辑全删 forceDelete | [UpdateDocument.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Jobs/Document/UpdateDocument.php) | L51 |
+| 关联删除实现 | [Relationships.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Traits/Relationships.php) | L41-L69 |
+| 前端表单提交 onSubmit | [global.js](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/resources/assets/js/mixins/global.js) | L290-L292 |
+| 发送按钮提交 | [documents.js](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/resources/assets/js/views/common/documents.js) | L884-L889 |
+| DocumentTotal sort_order 创建 | [CreateDocumentItemsAndTotals.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Jobs/Document/CreateDocumentItemsAndTotals.php) | L29-L157 |
+| 表单路由生成 | [ViewComponents.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Traits/ViewComponents.php) | L704-L736 |
 | 全局折扣分摊 | [CreateDocumentItemsAndTotals.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Jobs/Document/CreateDocumentItemsAndTotals.php) | L265 |
 | 汇总计算 | [CreateDocumentItemsAndTotals.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Jobs/Document/CreateDocumentItemsAndTotals.php) | L29 |
 | 单据行模型 | [DocumentItem.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Models/Document/DocumentItem.php) | - |
+| 单据行税模型（abs 存储无字段区分正负） | [DocumentItemTax.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Models/Document/DocumentItemTax.php) | - |
 | 单据主模型 | [Document.php](file:///d:/fz/0601-2/solo-dogfeeding/code/61-akaunting/app/Models/Document/Document.php) | - |
 
 ---

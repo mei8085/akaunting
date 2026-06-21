@@ -19,7 +19,7 @@ Recurring (定期/循环) 功能支持以下4种类型的单据自动周期性�
 
 ### 2.1 调度器配置
 
-文件：[Kernel.php](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Console/Kernel.php#L23-L37)
+文件：[Kernel.php](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Console/Kernel.php#L23-L59)
 
 ```php
 protected function schedule(Schedule $schedule)
@@ -30,11 +30,46 @@ protected function schedule(Schedule $schedule)
         ->dailyAt($schedule_time)
         ->runInBackground();
 }
+
+// 调度时区由 scheduleTimezone() 决定：
+protected function scheduleTimezone()
+{
+    return config('app.timezone');
+}
 ```
 
 - **执行频率**：每天一次，时间由 `app.schedule_time` 配置决定
 - **运行模式**：后台执行 (`runInBackground()`)
 - **命令签名**：`recurring:check`
+
+#### 2.1.1 scheduleTimezone 与 Recurr 公司时区的双时区错位（★补充）
+
+系统存在两层时区语义不同的"时区"：
+
+| 层 | 时区来源 | 作用域 | 影响范围 |
+|----|---------|--------|---------|
+| **Laravel Scheduler** | `config('app.timezone')`（服务器默认时区，通常 UTC） | 全局单例 | 决定 `dailyAt()` 在几点触发命令 —— **所有公司共享同一个触发时刻** |
+| **Recurr 日程引擎** | `setting('localisation.timezone')`（公司本地化配置） | 按公司切换 | 决定 `setTimezone()` 如何解释 started_at / 做 RRULE 日期加法 —— **每家公司独立时区** |
+
+**错位场景**：
+
+```
+服务器 app.timezone = UTC
+公司A localisation.timezone = Asia/Shanghai (UTC+8)
+公司B localisation.timezone = Europe/London (UTC+0)
+app.schedule_time = "00:00"
+
+每天 UTC 00:00（北京时间 08:00，伦敦时间 00:00）命令被唤醒，
+同时遍历所有公司的 recurring，
+每家公司内部用自己的 localisation.timezone 做 RRULE 计算。
+
+问题：对于 UTC+8 公司，"今天"的定义是北京时间 00:00~23:59，
+      但调度触发时北京时间是 08:00，"今天 00:00 的那条 schedule"
+      在 RecurringCheck 里的 endsBefore(明天) 仍然包含，能被生成，
+      不会错过，但语义上不是在"该公司当天凌晨"生成。
+```
+
+> 设计权衡：多租户共享一个 cron 触发点是常见取舍；真正精细的"按公司时区在该公司本地 00:00 触发"需要分公司调度队列，复杂度高得多。这里通过 Recurr 层按公司时区计算，**保证日期不会错生成**，只是触发时刻有偏移。
 
 ### 2.2 命令类
 
@@ -188,7 +223,61 @@ $owner  = !empty($request['created_by'])   ? $request['created_by']   : user_id(
 | `created_from` | 创建来源 | 见 3.3.2 request → source_name() 兜底 |
 | `created_by` | 创建人 | 见 3.3.2 request → user_id() 兜底 |
 
-### 3.4 模板识别：isRecurring 作用域
+### 3.4 updateRecurring()：frequency=no 删除分支 + update/create 双写入路径（★补充）
+
+**Trait**：[Traits/Recurring.php](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Traits/Recurring.php#L45-L91)
+
+updateRecurring 与 createRecurring 结构不同，它有 **三条分支**：
+
+```
+updateRecurring($request)
+    │
+    ├─► 【分支 1】frequency=no 或 empty → 删除分支
+    │     └─ if (empty($request['recurring_frequency']) || ($request['recurring_frequency'] == 'no')
+    │           $this->recurring()->delete()
+    │           return;
+    │
+    │ 含义：用户把原来的 recurring 模板改为"不重复"了，相当于解除 recurring 关联
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ frequency != no（走下面的 update 主流程（正常 recurring）            │
+│                                                          │
+│   ① 计算 frequency / interval / started_at 等字段          │
+│   （与 createRecurring 完全相同的逻辑                          │
+│                                                          │
+│   ② $recurring = $this->recurring()                        │
+│      $model_exists = $recurring->count()                    │
+│                                                          │
+│   ├─► 【分支 2】$model_exists = true → update 分支            │
+│   │     $recurring->update($data)                       │
+│   │       不写 created_from / created_by                  │
+│   │       recurring_status 只在 $request 有值时才写
+│   │
+│   └─► 【分支 3】$model_exists = false → create 分支           │
+│         $recurring->create(array_merge($data, [               │
+│             'status'       => ACTIVE_STATUS,                       │
+│             'created_from' => source 兜底,                        │
+│             'created_by'  => owner 兜底,                          │
+│         ])                                                  │
+│         含义：模型本身是普通单据（原无 recurring 关联，用户在编辑时                 │
+│         时第一次勾选 recurring                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 3.4.1 createRecurring vs updateRecurring 对比
+
+| 维度 | createRecurring | updateRecurring |
+|------|---------------|----------------|
+| **frequency=no/empty | `return;`（静默不操作 | **`$this->recurring()->delete()`（删除已有） |
+| **已有关联记录时 | `create（必须不存在才调用） | `update`（已存在则更新） |
+| **无关联记录时 | create（正常创建） | create（补创建，默认 status=active） |
+| **created_from/by** | 必写入（总是写） | update分支**不写**；create分支**写入 |
+| **status 写入** | 从 recurring_status 默认 ACTIVE_STATUS | update分支有 request 有值才写；create分支强制 ACTIVE_STATUS |
+
+> 典型触发路径：用户在编辑账单详情页点击 End 按钮，Controller 调 UpdateDocument/UpdateTransaction Job，Job 内部调用 `$model->updateRecurring($request)`，传 `recurring_status = END_STATUS`，走 update 分支的 status 写入路径（因为 request 有 recurring_status）。
+
+### 3.5 模板识别：isRecurring 作用域
 
 识别一个 Document 或 Transaction 是否为 recurring **模板**的方式是检查 `type` 字段是否以 `-recurring` 结尾。
 
@@ -224,38 +313,84 @@ handle() 入口
     ↓
 ① 预准备：关闭模型缓存、绑定自身到容器
     ↓
-② 获取所有 active 状态的 recurring 记录游标
+② Recurring::with('company')
+        ->active()
+        ->allCompanies()        ← ★ 禁用 Company 全局 scope，取所有公司
+        ->cursor()
     ↓
 ③ 逐条遍历 $recur {
-    3.1 公司有效性检查 (不存在/禁用/无活跃用户 则清理)
+    3.1 【孤儿清理1】公司不存在 → $recur->delete() + continue
     ↓
-    3.2 company($company_id)->makeCurrent()  ← 切换公司上下文
+    3.2 取模板 $template = $recur->recurable()
+                                    ->where('company_id', $recur->company_id)
+                                    ->first()
     ↓
-    3.3 获取关联模板 $template = $recur->recurable()->first()
+    3.3 【孤儿清理2】公司禁用 超3个月 → $recur->delete() + $template->delete() + continue
     ↓
-    3.4 getRemainingSchedules()  ← 计算剩余待生成的日程
+    3.4 【孤儿清理3】无活跃用户 超3个月 → $recur->delete() + $template->delete() + continue
     ↓
-    3.5 若无剩余日程 → status = completed，跳过
+    3.5 company($recur->company_id)->makeCurrent()  ← ★ 切换公司上下文
     ↓
-    3.6 endsBefore(明天) 过滤 → 只取今天及之前到期的
+    3.6 【孤儿清理4】模板已被删($template=null) → $recur->delete() + continue
     ↓
-    3.7 逐条遍历 $schedules {
+    3.7 getRemainingSchedules()  ← 计算剩余待生成的日程
+    ↓
+    3.8 若无剩余日程 → status = completed，跳过
+    ↓
+    3.9 endsBefore(明天) 过滤 → 只取今天及之前到期的
+    ↓
+    3.10 逐条遍历 $schedules {
         recur($template, $schedule_date)  ← ★ 生成单据
     }
 }
     ↓
-④ 清除当前公司上下文，结束
+④ Company::forgetCurrent() + 清除容器实例，结束
 ```
 
-### 4.2 公司有效性检查（跳过/清理策略）
+#### 4.1.1 allCompanies 禁用 Company 全局 scope 与 makeCurrent 切上下文（★补充）
 
-| 检查项 | 条件 | 处理 |
-|--------|------|------|
-| 公司不存在 | `empty($recur->company)` | 删除 recurring + 模板，跳过 |
-| 公司禁用 | `!$recur->company->enabled` 且 company 更新时间 > 3个月前 | 删除 recurring + 模板，跳过 |
-| 无活跃用户 | 所有用户 `last_logged_in_at` 均超过 3个月 | 删除 recurring + 模板，跳过 |
+**allCompanies 的实现**：
+[Abstracts/Model.php#L77-L80](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Abstracts/Model.php#L77-L80)
+```php
+public function scopeAllCompanies($query)
+{
+    return $query->withoutGlobalScope('App\Scopes\Company');
+}
+```
 
-### 4.3 计算剩余日程：getRemainingSchedules()
+**Company 全局 scope 的作用**：
+[Scopes/Company.php#L21-L35](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Scopes/Company.php#L21-L35)
+
+所有继承了 `Abstracts\Model` 且使用了 `Tenants` trait 的模型，**每一次查询**都会被自动附加 `WHERE company_id = company_id()` 条件，实现多租户隔离。
+
+| 阶段 | 是否有 Company scope | company_id 值 |
+|------|---------------------|---------------|
+| **初始状态**（CLI 启动） | 有（自动附加） | `null` → 可能查不到任何数据，或查到当前默认公司 |
+| **allCompanies() 之后**（查 recurring 列表） | **被移除** | 不限制 → 查出 **所有公司** 的 active recurring |
+| **makeCurrent() 之后**（处理某条 recurring） | 有（自动附加） | 切换为 `$recur->company_id` → 后续所有查询（模板、子单据、setting 配置）只看到该公司 |
+| **forgetCurrent() 之后**（遍历结束） | 有（自动附加） | 回到 null / 默认值 |
+
+**为什么要两步走？**
+1. `allCompanies()` 是**查询层面**去租户限制 → 保证能遍历到每个公司的 recurring 记录
+2. `makeCurrent()` 是**上下文层面**切租户 → 保证处理单条 recurring 时：
+   - `setting('localisation.timezone')` 返回该公司的时区
+   - 新建的 Document/Transaction 自动写入正确的 company_id
+   - Eloquent 查询默认带上该公司的过滤，不会误读写其他公司数据
+
+#### 4.1.2 四条孤儿清理路径（★补充）
+
+handle() 主循环中内置 4 个垃圾回收分支，防止脏数据（recurring 还在但关联对象已被删）长期占用调度资源：
+
+| 编号 | 检查点 | 代码位置 | 判断条件 | 清理动作 | 连带清理模板 |
+|------|--------|---------|---------|---------|------------|
+| **1** | 公司不存在 | [L62-L68](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Console/Commands/RecurringCheck.php#L62-L68) | `empty($recur->company)` | `$recur->delete()` | 否（无法取到） |
+| **2** | 公司禁用超 3 个月 | [L77-L89](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Console/Commands/RecurringCheck.php#L77-L89) | `!$company->enabled && updated_at < now-3month` | `$recur->delete()` | 是 `$template->delete()` |
+| **3** | 无活跃用户超 3 个月 | [L92-L112](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Console/Commands/RecurringCheck.php#L92-L112) | 所有用户 `last_logged_in_at < now-3month` | `$recur->delete()` | 是 `$template->delete()` |
+| **4** | 关联模板已被删 | [L116-L122](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Console/Commands/RecurringCheck.php#L116-L122) | `$template === null`（recurable 多态关联找不到对应记录） | `$recur->delete()` | 否（已不存在） |
+
+> 注意：检查点 1-3 在 **makeCurrent() 之前**执行，检查点 4 在 makeCurrent() 之后执行。因为检查点 4 需要先切到正确公司上下文，才能走 Company scope 查到对应的模板（多态关联的 recurable 表也受 Company scope 约束）。
+
+### 4.2 计算剩余日程：getRemainingSchedules()
 
 **文件**：[RecurringCheck.php](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Console/Commands/RecurringCheck.php#L243-L262)
 
@@ -305,7 +440,7 @@ $schedules = $this->getRemainingSchedules($template, $recur);
 
 > **设计优点**：无需持久化"失败队列"或"重试状态"。利用"日期集合差集"的天然幂等性，任何中断（异常、进程被杀、超时）都会在下次调度时自动补完所有"缺行"日期。代价：每次调度都要查子表日期，O(n) 去重。
 
-### 4.4 日程生成引擎：getRecurringSchedule()
+### 4.3 日程生成引擎：getRecurringSchedule()
 
 **Trait**：[Traits/Recurring.php](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Traits/Recurring.php#L93-L121)
 
@@ -329,7 +464,7 @@ getRecurringSchedule()
 ③ ArrayTransformer::transform($rule)  → RecurrenceCollection
 ```
 
-#### 4.4.1 setTimezone 调用的作用（★补充）
+#### 4.3.1 setTimezone 调用的作用（★补充）
 
 **Trait**：[Traits/Recurring.php](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Traits/Recurring.php#L105-L151)
 
@@ -360,7 +495,7 @@ public function getRecurringRuleTimeZone()
 
 **不设置的风险**：如果服务器默认时区（UTC）与公司时区（如 Asia/Shanghai）相差 8 小时，可能出现"1月31日 加1月"的边界运算被错位，导致生成的日期偏移 1 天。
 
-#### 4.4.2 VirtualLimit 的兜底动机（★补充）
+#### 4.3.2 VirtualLimit 的兜底动机（★补充）
 
 **Trait**：[Traits/Recurring.php](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Traits/Recurring.php#L168-L187)
 
@@ -413,7 +548,7 @@ protected function recur(Document|Transaction $template, Date $schedule_date): v
 **源码位置**：[RecurringCheck.php#L190-L203](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Console/Commands/RecurringCheck.php#L190-L203)
 
 ```
-getModel(Document|Transaction $template, Date $schedule_date): Document|Transaction|bool
+getModel(Document|Transaction $template, Date $schedule_date): Document|Transaction
     │
     ▼
 判断模板类型：
@@ -425,18 +560,19 @@ try { 调用具体方法 }
     │
     ├── 成功 → 返回 Document 或 Transaction 实例
     │
-    └── 失败 → catch(\Exception $e) { report($e); return false; }
-                └─ 异常只被 report 日志记录，不冒泡
-                   返回值类型从对象跌为 bool false
+    └── 失败 → catch(\Throwable $e) { report($e); return false; }
+                └─ ★ 源码缺陷：声明只返回 Document|Transaction，实际 return false
+                   在 strict_types=1 下会抛 TypeError，非严格模式 PHP 隐式转换
 ```
 
 **返回类型与异常出口要点：**
 
 | 项 | 说明 |
 |----|------|
-| **声明返回类型** | `Document|Transaction|bool` 三联合类型（PHP 8 联合类型） |
+| **声明返回类型** | `Document\|Transaction`（源码 [L190](file:///d:/fz/0601-2/solo-dogfeeding/code/62-akaunting/app/Console/Commands/RecurringCheck.php#L190)，**不是**三联合） |
 | **正常返回** | `Document` 或 `Transaction` Eloquent 模型实例 |
-| **异常出口** | `catch (\Exception $e) { report($e); return false; }` —— **任何异常都被吞掉**，写日志后返回 `false` |
+| **异常出口** | `catch (\Throwable $e) { report($e); return false; }` —— **任何 Throwable 都被吞掉**（比 \Exception 范围更大，含 Error/TypeError 等），写日志后返回 `false` |
+| **源码类型违例** | 声明返回 `Document\|Transaction`，实际 `return false` —— PHP 非 strict_types 模式下会隐式转换不报错，但严格模式下触发 `TypeError: Return value must be of type Document\|Transaction, bool returned` |
 | **调用方的短路处理** | `recur()` 里 `if (! $model = $this->getModel(...)) { return; }` —— 用 false 做松散比较直接跳过该 schedule |
 | **设计意图** | 失败隔离：某一个 schedule 日期生成失败（如 Cloneable 克隆异常、save 失败、关联更新异常），不影响其他日期和其他 recurring 继续执行 |
 
@@ -846,8 +982,16 @@ Company::forgetCurrent()
 
 10. **克隆 + 修正两步走**：使用 Cloneable 快速复制主记录及关联(去掉recurring以免模板关联链被复制)，再通过 updateRelationTypes 批量更新子关联的 type 字段与主记录对齐。
 
-11. **getModel 双类型返回 + 静默异常出口**：声明返回 `Document|Transaction|bool` 三联合类型；正常返回模型实例，异常时 catch 吞掉 + report 日志 + return false；调用方用 `!$model` 松散比较短路跳过。代价是任何异常都会被静默，只能靠日志发现。
+11. **getModel 类型违例 + 静默异常出口**：源码声明返回 `Document|Transaction`（非三联合），但 catch `\Throwable` 里实际 `return false`，是一个类型违例（strict_types 下 TypeError）。调用方用 `!$model` 松散比较短路跳过，所有异常都被吞掉，只能靠日志发现。
 
 12. **三状态机 + 双流转路径**：active(运行中)、ended(手动终止)、completed(自然完成) 三态。ended 由用户点击 End 按钮经 Update Job 的 updateRecurring 写入；completed 由调度器检测剩余日程为 0 时自动迁移。两态都是终态，不再进入 active scope 的调度遍历。
 
-13. **CreateDocument 四步前置流水线**：事务外依次执行 authorize(套餐配额校验，仅 invoice) → amount 空值兜底为 0 → discount 老字段兼容为 discount_rate → DocumentCreating 事件；事务内第一步是 Document::create 紧接着 attachment 媒体上传(磁盘IO不在DB事务内，回滚不删文件)。
+13. **CreateDocument 四步前置流水线**：事务外依次执行 authorize(套餐配额校验仅 invoice) → amount 空值兜底为 0 → discount 老字段兼容为 discount_rate → DocumentCreating 事件；事务内第一步是 Document::create 紧接着 attachment 媒体上传(磁盘IO不在DB事务内，回滚不删文件)。
+
+14. **scheduleTimezone/Recurr 双时区错位**：Laravel Scheduler 用 `config('app.timezone')`（UTC）全局唯一触发时刻；Recurr 内部用 `setting('localisation.timezone')`（按公司切换）。多公司各时区下调度触发有偏移，但 Recurr 层保证日期计算不偏差。
+
+15. **allCompanies 去 scope + makeCurrent 切上下文**：allCompanies() 移除 Company 全局 scope 查出所有公司 recurring；逐条 makeCurrent() 切上下文，使 setting() 配置、后续查询、新建模型的 company_id 自动属于该公司。防止跨公司数据泄露。
+
+16. **4 条孤儿清理路径**：handle() 主循环内置 4 个 GC 分支——公司不存在、公司禁用超3个月、无活跃用户超3个月、关联模板已被删——分别在 makeCurrent 前后分布执行，防止脏数据长期占用调度。
+
+17. **updateRecurring 三分支架构**：frequency=no 走删除分支（与 createRecurring 的 no return 不同）；frequency 有效时按 recurring 关联是否存在分别走 update（不改 created_from/by）或 create（补创建，强制 ACTIVE_STATUS）分支。End 按钮改 ended 状态正是走 update 分支的 status 写入路径。
